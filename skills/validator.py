@@ -8,6 +8,12 @@
 #   30  CheckovValidatorSkill      — real Checkov CLI (unchanged)
 #   40  IntentAlignmentValidatorSkill — LLM scoring (accuracy + coverage)
 #
+# Gate semantics for can_trigger()
+# ---------------------------------
+# Each validator requires its upstream predecessor to be PASS or ERROR.
+# ERROR means the tool is absent from PATH — it is treated as "skipped"
+# so the pipeline keeps moving rather than stalling forever.
+#
 # Progressive disclosure:
 #   All heavy imports (yaml, subprocess, shutil, json, re) are deferred to
 #   load_level2() so the orchestrator pays nothing at registration time.
@@ -24,6 +30,9 @@ from typing import Any
 from enums import Severity, SkillPhase, ValidationStatus
 from god import AcceptanceCriterion, GroundedObjectivesDocument, ValidationFinding, ValidationResult
 from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
+
+
+_PASS_OR_ERROR = (ValidationStatus.PASS, ValidationStatus.ERROR)
 
 
 # =============================================================================
@@ -55,7 +64,6 @@ class YAMLSyntaxValidatorSkill(Skill):
             tags=["static", "syntax", "yaml"],
         )
 
-    # L2: lazy-import yaml
     def load_level2(self) -> bool:
         if not self._level2_loaded:
             import yaml as _yaml
@@ -72,18 +80,15 @@ class YAMLSyntaxValidatorSkill(Skill):
     def execute(self, context: SkillContext) -> SkillResult:
         god = context.god
         template_body = god.template.body
-        
+
         result = ValidationResult(validator_name="yaml_syntax")
         result.started_at = datetime.now().isoformat()
-        
+
         try:
             import yaml
-            yaml.safe_load(template_body)  # ← the actual check
-            
-            # ✅ CRITICAL: must explicitly record PASS
+            yaml.safe_load(template_body)
             result.status = ValidationStatus.PASS
             god.set_validation_result("yaml_syntax", result, actor="yaml-validator")
-            
             return SkillResult.success_with_changes(
                 self.metadata.name, ["yaml_syntax: PASS"]
             )
@@ -102,30 +107,22 @@ class YAMLSyntaxValidatorSkill(Skill):
 
 
 # =============================================================================
-# 2. CFN-LINT VALIDATOR  (real cfn-lint CLI — no hand-rolled schema dict)
+# 2. CFN-LINT VALIDATOR
 # =============================================================================
 
 class CFNLintValidatorSkill(Skill):
     """
     Validates CloudFormation template structure and schema using the real
-    **cfn-lint** CLI tool.
+    cfn-lint CLI tool.
 
-    Replaces the previous hand-rolled RESOURCE_SCHEMAS dict.  cfn-lint covers
-    all ~800 AWS resource types and is maintained by the AWS CDK team, giving
-    far better coverage than any static mapping.
-
-    Install: ``pip install cfn-lint``
-
-    Progressive disclosure:
-      L1  metadata — always resident
-      L2  shutil / subprocess — imported lazily in load_level2()
-      L3  (none)
+    Gate: yaml_syntax must be PASS (YAML errors must be fixed first).
+    Install: pip install cfn-lint
     """
 
     _SEVERITY_MAP = {
-        "E": Severity.CRITICAL,   # Errors
-        "W": Severity.HIGH,       # Warnings
-        "I": Severity.INFO,       # Informational
+        "E": Severity.CRITICAL,
+        "W": Severity.HIGH,
+        "I": Severity.INFO,
     }
 
     def _define_metadata(self) -> SkillMetadata:
@@ -152,7 +149,6 @@ class CFNLintValidatorSkill(Skill):
             tags=["static", "cfn-lint", "schema", "cloudformation"],
         )
 
-    # L2: check cfn-lint availability once
     def load_level2(self) -> bool:
         if not self._level2_loaded:
             import shutil as _shutil
@@ -165,6 +161,8 @@ class CFNLintValidatorSkill(Skill):
         return True
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
+        # yaml_syntax must be PASS (not just non-ERROR) — broken YAML cannot
+        # be linted.  cfn_lint itself must be PENDING.
         return (
             god.validation_state["yaml_syntax"].status == ValidationStatus.PASS
             and god.validation_state["cfn_lint"].status == ValidationStatus.PENDING
@@ -177,9 +175,6 @@ class CFNLintValidatorSkill(Skill):
         vr = ValidationResult(validator_name="cfn_lint")
         vr.started_at = datetime.now().isoformat()
 
-        # ------------------------------------------------------------------
-        # Preflight: is cfn-lint available?
-        # ------------------------------------------------------------------
         cfn_lint_bin = self._shutil.which("cfn-lint")
         if cfn_lint_bin is None:
             self._logger.error("cfn-lint not found on PATH. Install: pip install cfn-lint")
@@ -190,9 +185,6 @@ class CFNLintValidatorSkill(Skill):
             skill_result.success = False
             return skill_result
 
-        # ------------------------------------------------------------------
-        # Write template to temp file
-        # ------------------------------------------------------------------
         tmp_dir = tempfile.mkdtemp(prefix="cfnlint_skill_")
         template_path = os.path.join(tmp_dir, "template.yaml")
 
@@ -204,7 +196,7 @@ class CFNLintValidatorSkill(Skill):
                 cfn_lint_bin,
                 "--template", template_path,
                 "--format", "json",
-                "--include-checks", "W",  # include warnings too
+                "--include-checks", "W",
             ]
             self._logger.info(f"Running: {' '.join(cmd)}")
 
@@ -214,7 +206,6 @@ class CFNLintValidatorSkill(Skill):
                 text=True,
                 timeout=context.config.get("cfn_lint_timeout_seconds", 60),
             )
-            # cfn-lint exit codes: 0=clean, 2=lint findings, 4=invalid template, 6=both
             raw = proc.stdout.strip()
             vr.raw_output = raw[:4000]
             vr.tool_version = self._extract_version(proc.stderr)
@@ -257,25 +248,7 @@ class CFNLintValidatorSkill(Skill):
         god.set_validation_result("cfn_lint", vr, self.metadata.name)
         return skill_result
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _parse_cfn_lint_output(
-        self, raw: str
-    ) -> list[ValidationFinding]:
-        """
-        cfn-lint --format json emits a JSON array of match objects:
-        [
-          {
-            "Rule": {"Id": "E3012", "ShortDescription": "..."},
-            "Location": {"Start": {"LineNumber": 10}, "Path": {"CfnPath": [...]}},
-            "Message": "...",
-            "Level": "Error"   # Error | Warning | Informational
-          },
-          ...
-        ]
-        """
+    def _parse_cfn_lint_output(self, raw: str) -> list[ValidationFinding]:
         findings: list[ValidationFinding] = []
         if not raw:
             return findings
@@ -288,22 +261,15 @@ class CFNLintValidatorSkill(Skill):
         for match in data:
             rule = match.get("Rule", {})
             rule_id = rule.get("Id", "UNKNOWN")
-            level = match.get("Level", "Warning")
             message = match.get("Message", "")
-
-            # Map Level -> Severity
             first_char = rule_id[0].upper() if rule_id else "W"
             severity = self._SEVERITY_MAP.get(first_char, Severity.MEDIUM)
-
-            # Extract resource from CfnPath e.g. ["Resources", "MyBucket", "Properties", ...]
             cfn_path = match.get("Location", {}).get("Path", {}).get("CfnPath", [])
             resource_name = cfn_path[1] if len(cfn_path) > 1 else "(template)"
             resource_type = cfn_path[0] if cfn_path else "Template"
-
             line_number = (
                 match.get("Location", {}).get("Start", {}).get("LineNumber", 0)
             )
-
             findings.append(ValidationFinding(
                 rule_id=rule_id,
                 resource_name=resource_name,
@@ -327,20 +293,16 @@ class CFNLintValidatorSkill(Skill):
 
 
 # =============================================================================
-# 3. CHECKOV VALIDATOR  (unchanged — already uses the real CLI)
+# 3. CHECKOV VALIDATOR
 # =============================================================================
 
 class CheckovValidatorSkill(Skill):
     """
     Validates security best practices using the real Checkov CLI.
 
-    Invokes: checkov -f <template> --framework cloudformation --output json
-    Requires: ``pip install checkov``
-
-    Progressive disclosure:
-      L1  metadata     — always resident
-      L2  shutil/json  — imported lazily in load_level2()
-      L3  (none)
+    Gate: cfn_lint must be PASS **or ERROR** (missing cfn-lint tool is treated
+    as skipped — the pipeline must not stall here).
+    Install: pip install checkov
     """
 
     _SEVERITY_MAP: dict[str, Severity] = {
@@ -370,7 +332,7 @@ class CheckovValidatorSkill(Skill):
             ),
             phase=SkillPhase.VALIDATION,
             trigger_condition=(
-                "validation_state.cfn_lint is PASS "
+                "validation_state.cfn_lint is PASS or ERROR "
                 "AND validation_state.checkov is PENDING"
             ),
             writes_to=["validation_state.checkov"],
@@ -379,7 +341,6 @@ class CheckovValidatorSkill(Skill):
             tags=["static", "security", "checkov"],
         )
 
-    # L2: check checkov availability once
     def load_level2(self) -> bool:
         if not self._level2_loaded:
             import shutil as _shutil
@@ -394,8 +355,10 @@ class CheckovValidatorSkill(Skill):
         return True
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
+        # Accept cfn_lint=ERROR (tool absent) as equivalent to PASS so the
+        # chain does not stall when cfn-lint is not installed.
         return (
-            god.validation_state["cfn_lint"].status == ValidationStatus.PASS
+            god.validation_state["cfn_lint"].status in _PASS_OR_ERROR
             and god.validation_state["checkov"].status == ValidationStatus.PENDING
         )
 
@@ -548,11 +511,9 @@ class CheckovValidatorSkill(Skill):
 
 
 # =============================================================================
-# 4. INTENT ALIGNMENT VALIDATOR  (LLM-based accuracy + coverage scoring)
+# 4. INTENT ALIGNMENT VALIDATOR
 # =============================================================================
 
-# LLM prompt template — kept as a module-level constant so it is visible but
-# NOT evaluated until the skill's execute() method is called (L2 loading).
 _INTENT_ALIGNMENT_PROMPT = """
 You are an expert AWS CloudFormation reviewer.
 You will be given:
@@ -607,22 +568,15 @@ class IntentAlignmentValidatorSkill(Skill):
     Validates that the generated template satisfies the user's original intent
     using an LLM-based two-dimensional scoring approach.
 
+    Gate: checkov must be PASS **or ERROR** (missing checkov tool is treated
+    as skipped — the pipeline must not stall here).
+
     Dimensions
     ----------
     Accuracy  — each resource present in the template is correct and complete
     Coverage  — all resources / requirements from the intent are present
 
-    Replaces the previous deterministic property-path checker which could only
-    handle a handful of hard-coded resource types and check_types.
-
     Pass threshold: accuracy_score >= 0.8 AND coverage_score >= 0.8.
-    Configure via context.config["intent_pass_threshold"] (default 0.8).
-
-    Progressive disclosure
-    ----------------------
-    L1  metadata — always resident
-    L2  json     — imported lazily in load_level2()
-    L3  (none)
     """
 
     def _define_metadata(self) -> SkillMetadata:
@@ -642,7 +596,7 @@ class IntentAlignmentValidatorSkill(Skill):
             ),
             phase=SkillPhase.VALIDATION,
             trigger_condition=(
-                "validation_state.checkov is PASS "
+                "validation_state.checkov is PASS or ERROR "
                 "AND validation_state.intent_alignment is PENDING"
             ),
             writes_to=["validation_state.intent_alignment"],
@@ -654,20 +608,8 @@ class IntentAlignmentValidatorSkill(Skill):
             ],
             priority=40,
             tags=["llm", "intent", "accuracy", "coverage"],
-            examples=[
-                {
-                    "input": "User asks for private S3 with encryption; template has public S3",
-                    "output": {
-                        "accuracy_score": 0.4,
-                        "coverage_score": 1.0,
-                        "overall_pass": False,
-                        "accuracy_findings": [{"severity": "CRITICAL", "message": "S3 bucket is publicly accessible"}],
-                    },
-                }
-            ],
         )
 
-    # L2: lazy-import json
     def load_level2(self) -> bool:
         if not self._level2_loaded:
             import json as _json
@@ -676,8 +618,9 @@ class IntentAlignmentValidatorSkill(Skill):
         return True
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
+        # Accept checkov=ERROR (tool absent) as equivalent to PASS.
         return (
-            god.validation_state["checkov"].status == ValidationStatus.PASS
+            god.validation_state["checkov"].status in _PASS_OR_ERROR
             and god.validation_state["intent_alignment"].status == ValidationStatus.PENDING
         )
 
@@ -692,7 +635,6 @@ class IntentAlignmentValidatorSkill(Skill):
         llm: OpenRouterClient | None = context.get_config("llm")
 
         if llm is None:
-            # No LLM — fall back to a basic structural check
             self._logger.warning(
                 "No LLM client; falling back to structural intent check."
             )
@@ -700,9 +642,6 @@ class IntentAlignmentValidatorSkill(Skill):
 
         threshold: float = context.config.get("intent_pass_threshold", 0.8)
 
-        # ------------------------------------------------------------------
-        # Build the LLM user message
-        # ------------------------------------------------------------------
         criteria_text = "\n".join(
             f"  [{c.id}] {c.description}"
             for c in god.intent.acceptance_criteria
@@ -726,10 +665,8 @@ class IntentAlignmentValidatorSkill(Skill):
                 temperature=0.0,
             )
 
-            # Strip optional markdown code fences the LLM might wrap the JSON in
             import re as _re
             raw_clean = _re.sub(r'^```[\w]*\n?|\n?```$', '', raw.strip(), flags=_re.MULTILINE)
-
             data: dict = self._json.loads(raw_clean)
 
         except self._json.JSONDecodeError as exc:
@@ -746,20 +683,15 @@ class IntentAlignmentValidatorSkill(Skill):
             skill_result.success = False
             return skill_result
 
-        # ------------------------------------------------------------------
-        # Parse scores and findings
-        # ------------------------------------------------------------------
         accuracy_score: float = float(data.get("accuracy_score", 0.0))
         coverage_score: float = float(data.get("coverage_score", 0.0))
         overall_pass: bool = data.get("overall_pass", False)
 
-        # Store raw scores as metrics on the ValidationResult
         vr.metrics = {
             "accuracy_score": accuracy_score,
             "coverage_score": coverage_score,
         }
 
-        # Convert both finding lists to ValidationFinding objects
         findings: list[ValidationFinding] = []
         for raw_f in data.get("accuracy_findings", []) + data.get("coverage_findings", []):
             sev_str = (raw_f.get("severity") or "HIGH").upper()
@@ -779,7 +711,6 @@ class IntentAlignmentValidatorSkill(Skill):
             ))
         vr.findings = findings
 
-        # Mark each acceptance criterion as met/unmet based on LLM findings
         finding_criterion_ids = {
             f.rule_id for f in findings if f.severity in (Severity.CRITICAL, Severity.HIGH)
         }
@@ -806,20 +737,12 @@ class IntentAlignmentValidatorSkill(Skill):
         god.set_validation_result("intent_alignment", vr, self.metadata.name)
         return skill_result
 
-    # ------------------------------------------------------------------
-    # Fallback: structural check when no LLM is available
-    # ------------------------------------------------------------------
     def _fallback_structural_check(
         self,
         god: GroundedObjectivesDocument,
         vr: ValidationResult,
         skill_result: SkillResult,
     ) -> SkillResult:
-        """
-        Minimal offline check: verify that at least one resource of each
-        expected type is present in the template.  Does NOT attempt property-
-        level checks — that requires the LLM path.
-        """
         import yaml as _yaml
         try:
             template = _yaml.safe_load(god.template.body)
