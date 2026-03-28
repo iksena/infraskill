@@ -12,7 +12,7 @@ The Orchestrator is NOT an LLM agent - it is a pure state machine that:
 5. Produces complete audit trails
 
 Author: INFRA-SKILL
-Version: 1.0.0
+Version: 1.1.0  (deterministic phase-gated routing)
 """
 
 from __future__ import annotations
@@ -163,19 +163,31 @@ class Orchestrator:
     
     It is a DETERMINISTIC STATE MACHINE, not an LLM agent. It makes routing
     decisions based purely on the GOD state and configuration rules.
-    
-    Responsibilities:
-    1. Manage the GOD lifecycle
-    2. Route to skills based on GOD state and skill triggers
-    3. Enforce validation gates (no forward progress on failures)
-    4. Implement feedback loops with loop guards
-    5. Emit events for observability
-    6. Produce complete audit trails
-    
-    Key principle: The orchestrator NEVER generates content. It only decides
-    WHICH skill should run next and WHETHER to continue the pipeline.
+
+    Pipeline stages (in order):
+        PLANNING → ENGINEERING → ASSEMBLING → VALIDATING
+                                                   ↓ (failures)
+                                              REMEDIATING
+                                                   ↓
+                                              VALIDATING  (repeat up to max_remediation_rounds)
+                                                   ↓ (all pass)
+                                              SUCCEEDED
+
+    Key principle: the orchestrator determines the *required state* from GOD
+    first (_determine_target_state), transitions to it, then selects a skill
+    from that state's phase only.  LLM-based skill selection is used as a
+    tiebreaker *within* a phase when more than one skill can trigger.
     """
     
+    # Ordered pipeline stages — the deterministic order of phase progression.
+    _STAGE_ORDER: list[OrchestratorState] = [
+        OrchestratorState.PLANNING,
+        OrchestratorState.ENGINEERING,
+        OrchestratorState.ASSEMBLING,
+        OrchestratorState.VALIDATING,
+        OrchestratorState.REMEDIATING,
+    ]
+
     def __init__(self, config: OrchestratorConfig = None):
         self._logger = logging.getLogger("INFRA-SKILL.Orchestrator")
         self.config = config or OrchestratorConfig()
@@ -243,64 +255,66 @@ class Orchestrator:
         # Checkpoint on major transitions
         if self.config.checkpoint_on_phase_change and self.god:
             self.god.save_checkpoint(f"state:{new_state.name}", "orchestrator")
-    
+
+    # -------------------------------------------------------------------------
+    # Deterministic target-state resolution
+    # -------------------------------------------------------------------------
+
     def _determine_target_state(self) -> OrchestratorState:
         """
-        Determine what state we should be in based on GOD.
-        This is the core routing logic.
+        Derive the *required* orchestrator state purely from GOD content.
+
+        Priority order (highest first):
+          1. Guard rails   — terminal, loop limit, iteration limit
+          2. Success gate  — all validations passed
+          3. Failure gate  — validations failed → REMEDIATING (or ESCALATED)
+          4. Forward progress — what is still missing in the GOD?
+
+        This method is the single source of truth for state transitions.
+        Nothing else should call _transition_to directly except run() and
+        select_next_skill() acting on the value returned here.
         """
         if self.god is None:
             return OrchestratorState.UNINITIALIZED
         
-        # Terminal states are sticky
+        # 1. Sticky terminal states
         if self.state.is_terminal():
             return self.state
         
-        # Check loop guard
+        # 2. Loop guards
         if self.god.get_remediation_round() >= self.config.max_remediation_rounds:
             return OrchestratorState.ESCALATED
-        
-        # Check iteration limit
         if self._iteration >= self.config.max_total_iterations:
             return OrchestratorState.ESCALATED
         
-        # If all validations passed, we're done
+        # 3. Success
         if self.god.all_validations_passed():
             return OrchestratorState.SUCCEEDED
         
-        # If we have blocking failures, go to remediation
+        # 4. Validation failures → remediate
         if self.god.has_failed_validations():
-            # But only if we haven't exhausted retries
-            if self.god.get_remediation_round() < self.config.max_remediation_rounds:
-                return OrchestratorState.REMEDIATING
-            else:
-                return OrchestratorState.ESCALATED
+            return OrchestratorState.REMEDIATING
         
-        # Determine state based on what's missing/pending
+        # 5. Forward-progress: derive from what GOD is still missing
         if not self.god.intent.resources:
             return OrchestratorState.PLANNING
-        
+
         if not self.god.template.resources and not self.god.template.body:
             return OrchestratorState.ENGINEERING
-        
-        # Check if template needs assembly
+
+        # Template blocks generated but not yet assembled into a body
         if self.god.template.resources and not self.god.template.body:
             return OrchestratorState.ASSEMBLING
-        
+
+        # Body exists but missing the CloudFormation header → re-assemble
         if "AWSTemplateFormatVersion" not in self.god.template.body:
             return OrchestratorState.ASSEMBLING
-        
-        if self.god.has_pending_validations():
-            return OrchestratorState.VALIDATING
-        
-        # Default to validating if we have a template
-        if self.god.template.body:
-            return OrchestratorState.VALIDATING
-        
-        return OrchestratorState.ENGINEERING
-    
+
+        # Template ready — validate (pending or re-validate after remediation)
+        return OrchestratorState.VALIDATING
+
     def _state_to_phase(self, state: OrchestratorState) -> Optional[SkillPhase]:
-        """Map orchestrator state to skill phase"""
+        """Map orchestrator state to the corresponding skill phase."""
         mapping = {
             OrchestratorState.PLANNING: SkillPhase.PLANNING,
             OrchestratorState.ENGINEERING: SkillPhase.ENGINEERING,
@@ -309,33 +323,100 @@ class Orchestrator:
             OrchestratorState.REMEDIATING: SkillPhase.REMEDIATION,
         }
         return mapping.get(state)
-    
+
     # -------------------------------------------------------------------------
-    # Skill Selection and Execution
+    # Deterministic skill selection (LLM as tiebreaker only)
     # -------------------------------------------------------------------------
 
     def select_next_skill(self) -> Optional[Skill]:
-        triggerable = self.registry.get_triggerable(self.god)
-        if not triggerable:
+        """
+        Select the next skill to run using a strict two-step algorithm:
+
+        Step 1 — Deterministic state resolution
+            Call _determine_target_state().  If it differs from self.state,
+            transition immediately.  This guarantees that after every skill
+            execution the orchestrator re-evaluates which stage it should be
+            in before picking a skill.
+
+        Step 2 — Phase-gated candidate selection
+            Only skills belonging to the *current state's phase* are
+            considered.  This prevents cross-phase skill bleeding (e.g.
+            a validator firing while we're still PLANNING).
+
+            Within the phase, skills are pre-sorted by priority (ascending)
+            so the deterministic fallback is always the highest-priority
+            triggerable skill.
+
+        Step 3 — LLM tiebreaker (optional, within-phase only)
+            If there is exactly one candidate, return it immediately — no LLM
+            call needed.  If there are multiple candidates AND an LLM client
+            is configured, ask the LLM to choose from *this phase's skills
+            only*.  On any LLM failure the highest-priority skill wins.
+        """
+        # ── Step 1: resolve required state and transition if needed ──────────
+        target_state = self._determine_target_state()
+
+        if target_state != self.state:
+            reason_map = {
+                OrchestratorState.PLANNING:    "intent missing — re-plan",
+                OrchestratorState.ENGINEERING: "template missing — engineer",
+                OrchestratorState.ASSEMBLING:  "resources ready — assemble",
+                OrchestratorState.VALIDATING:  "template ready — validate",
+                OrchestratorState.REMEDIATING: "validation failures — remediate",
+                OrchestratorState.SUCCEEDED:   "all validations passed",
+                OrchestratorState.ESCALATED:   "loop guard triggered",
+            }
+            self._transition_to(target_state, reason_map.get(target_state, "auto-transition"))
+
+        if self.state.is_terminal():
             return None
 
-        # Fast path: only one option — no need to invoke LLM
-        if len(triggerable) == 1:
-            return triggerable[0]
+        # ── Step 2: collect candidates from *this phase only* ────────────────
+        target_phase = self._state_to_phase(self.state)
+        if target_phase is None:
+            return None
 
+        # Emit phase-change event when we enter a new phase
+        if target_phase != self._current_phase:
+            old_phase = self._current_phase
+            self._current_phase = target_phase
+            self.events.emit(OrchestratorEventType.PHASE_CHANGED, {
+                "old_phase": old_phase.name if old_phase else None,
+                "new_phase": target_phase.name,
+            })
+
+        # Skills for this phase are already sorted by priority (ascending = higher priority first)
+        phase_skills = self.registry.get_by_phase(target_phase)
+        candidates = [s for s in phase_skills if s.can_trigger(self.god)]
+
+        if not candidates:
+            return None
+
+        # ── Step 3: deterministic fast path or LLM tiebreaker ────────────────
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Multiple candidates in the same phase — try LLM tiebreaker
         llm = self.config.llm_client
         if llm is None:
-            self._logger.warning("No LLM client — falling back to priority-based routing")
-            return triggerable[0]
+            self._logger.debug(
+                f"No LLM client — using priority-based selection among "
+                f"{[s.metadata.name for s in candidates]}"
+            )
+            return candidates[0]
 
+        # Build a compact snapshot for the LLM — only the metadata of
+        # phase-eligible candidates, not the full registry.
         god_snapshot = json.dumps(self.god.intent.to_dict(), indent=2)[:2000]
-        skill_table = json.dumps(self.registry.get_metadata_table(), indent=2)
+        candidate_table = json.dumps(
+            [s.metadata.to_dict() for s in candidates], indent=2
+        )
 
         try:
             raw = llm.complete(
                 system=SKILL_SELECTOR_PROMPT.format(
                     god_snapshot=god_snapshot,
-                    skill_metadata_table=skill_table,
+                    skill_metadata_table=candidate_table,
                 ),
                 user="Which skill should run next?",
                 temperature=0.0,
@@ -346,58 +427,23 @@ class Orchestrator:
             rationale = decision.get("rationale", "")
 
             skill = self.registry.get(chosen_name)
-            if skill and skill.can_trigger(self.god):
+            if skill and skill in candidates:
                 self._logger.info(f"LLM selected skill '{chosen_name}': {rationale}")
                 return skill
 
             self._logger.warning(
-                f"LLM chose invalid skill '{chosen_name}', falling back to priority routing"
+                f"LLM chose '{chosen_name}' which is not a valid candidate "
+                f"for phase {target_phase.name}; falling back to priority routing"
             )
-            return triggerable[0]
+            return candidates[0]
 
         except (json.JSONDecodeError, KeyError) as e:
-            self._logger.warning(f"Skill selector LLM failed ({e}), using priority fallback")
-            return triggerable[0]
+            self._logger.warning(f"Skill selector LLM parse error ({e}), using priority fallback")
+            return candidates[0]
         except (TimeoutError, RuntimeError) as e:
             self._logger.warning(f"Skill selector LLM timed out ({e}), using priority fallback")
-            return triggerable[0]
-    
-    def _check_phase_advancement(self, current_phase: SkillPhase) -> Optional[Skill]:
-        """Check if we should advance to the next phase and return a skill from it"""
-        
-        if current_phase == SkillPhase.ENGINEERING:
-            assembly_skills = self.registry.get_by_phase(SkillPhase.ASSEMBLY)
-            for skill in assembly_skills:
-                if skill.can_trigger(self.god):
-                    self._transition_to(OrchestratorState.ASSEMBLING, "engineering complete")
-                    return skill
-        
-        elif current_phase == SkillPhase.ASSEMBLY:
-            self._transition_to(OrchestratorState.VALIDATING, "assembly complete")
-            validation_skills = self.registry.get_by_phase(SkillPhase.VALIDATION)
-            for skill in validation_skills:
-                if skill.can_trigger(self.god):
-                    return skill
-        
-        elif current_phase == SkillPhase.VALIDATION:
-            if self.god.all_validations_passed():
-                self._transition_to(OrchestratorState.SUCCEEDED, "all validations passed")
-            elif self.god.has_failed_validations():
-                self._transition_to(OrchestratorState.REMEDIATING, "validation failures detected")
-                remediation_skills = self.registry.get_by_phase(SkillPhase.REMEDIATION)
-                for skill in remediation_skills:
-                    if skill.can_trigger(self.god):
-                        return skill
-        
-        elif current_phase == SkillPhase.REMEDIATION:
-            self._transition_to(OrchestratorState.VALIDATING, "remediation complete")
-            validation_skills = self.registry.get_by_phase(SkillPhase.VALIDATION)
-            for skill in validation_skills:
-                if skill.can_trigger(self.god):
-                    return skill
-        
-        return None
-    
+            return candidates[0]
+
     def _execute_skill(self, skill: Skill) -> SkillResult:
         """
         Execute a skill with full lifecycle management.
@@ -514,6 +560,14 @@ class Orchestrator:
     def run(self, user_prompt: str) -> dict:
         """
         Execute the full pipeline for a user prompt.
+
+        The loop is intentionally simple: each iteration calls
+        select_next_skill() which handles all state transitions internally
+        via _determine_target_state().  The loop only needs to handle:
+          - Terminal state detection (break)
+          - No-skill-found detection (classify and break)
+          - Skill execution and result logging
+          - Human-review escalation
         """
         self._logger.info("=" * 70)
         self._logger.info("INFRA-SKILL Pipeline Starting")
@@ -549,11 +603,15 @@ class Orchestrator:
                 self._logger.info(f"Terminal state reached: {self.state.name}")
                 break
             
+            # select_next_skill drives all state transitions deterministically
             skill = self.select_next_skill()
             
             if skill is None:
                 self._logger.info("No skill can trigger")
-                if self.god.all_validations_passed():
+                # Classify why no skill could be found
+                if self.state.is_terminal():
+                    pass  # already handled above
+                elif self.god.all_validations_passed():
                     self._transition_to(OrchestratorState.SUCCEEDED, "all validations passed")
                 elif self.god.has_failed_validations():
                     if self.god.get_remediation_round() >= self.config.max_remediation_rounds:
@@ -562,9 +620,15 @@ class Orchestrator:
                             "remediation_rounds": self.god.get_remediation_round()
                         })
                     else:
-                        self._transition_to(OrchestratorState.FAILED, "no skills can remediate failures")
+                        self._transition_to(
+                            OrchestratorState.FAILED,
+                            f"no skills can remediate failures in phase {self._current_phase}"
+                        )
                 else:
-                    self._transition_to(OrchestratorState.FAILED, "pipeline stuck - no triggerable skills")
+                    self._transition_to(
+                        OrchestratorState.FAILED,
+                        f"pipeline stuck — no triggerable skills in phase {self._current_phase}"
+                    )
                 break
             
             self._logger.info(f"Executing: {skill.metadata.name}")
