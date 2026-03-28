@@ -71,32 +71,34 @@ class YAMLSyntaxValidatorSkill(Skill):
 
     def execute(self, context: SkillContext) -> SkillResult:
         god = context.god
-        skill_result = SkillResult(success=True, skill_name=self.metadata.name)
-
-        vr = ValidationResult(validator_name="yaml_syntax")
-        vr.started_at = datetime.now().isoformat()
-
+        template_body = god.template.body
+        
+        result = ValidationResult(validator_name="yaml_syntax")
+        result.started_at = datetime.now().isoformat()
+        
         try:
-            parsed = self._yaml.safe_load(god.template.body)
-            if parsed is None:
-                vr.status = ValidationStatus.FAIL
-                vr.errors = ["Template parsed to None — empty or invalid"]
-                skill_result.success = False
-            elif not isinstance(parsed, dict):
-                vr.status = ValidationStatus.FAIL
-                vr.errors = ["Template root must be a YAML mapping"]
-                skill_result.success = False
-            else:
-                vr.status = ValidationStatus.PASS
-                skill_result.changes_made.append("YAML syntax validated")
-        except self._yaml.YAMLError as exc:
-            vr.status = ValidationStatus.FAIL
-            vr.errors = [f"YAML parse error: {exc}"]
-            skill_result.success = False
-
-        vr.completed_at = datetime.now().isoformat()
-        god.set_validation_result("yaml_syntax", vr, self.metadata.name)
-        return skill_result
+            import yaml
+            yaml.safe_load(template_body)  # ← the actual check
+            
+            # ✅ CRITICAL: must explicitly record PASS
+            result.status = ValidationStatus.PASS
+            god.set_validation_result("yaml_syntax", result, actor="yaml-validator")
+            
+            return SkillResult.success_with_changes(
+                self.metadata.name, ["yaml_syntax: PASS"]
+            )
+        except yaml.YAMLError as e:
+            result.status = ValidationStatus.FAIL
+            result.errors.append(str(e))
+            result.findings.append(ValidationFinding(
+                rule_id="YAML001",
+                resource_name="template",
+                resource_type="template",
+                severity=Severity.CRITICAL,
+                message=str(e),
+            ))
+            god.set_validation_result("yaml_syntax", result, actor="yaml-validator")
+            return SkillResult.failure(self.metadata.name, f"YAML parse error: {e}")
 
 
 # =============================================================================
