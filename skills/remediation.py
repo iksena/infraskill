@@ -14,16 +14,18 @@ _TEMPLATE_LEVEL_RESOURCE_NAMES = {"(template)", "", "TEMPLATE"}
 
 class RemediationSkill(Skill):
     """
-    The Remediation Agent analyzes validation failures and applies targeted fixes.
+    Analyzes validation failures and applies targeted fixes.
 
-    Two-tier strategy:
+    Two-tier strategy
+    -----------------
     1. Deterministic patches — fast, precise, zero LLM cost for known rule IDs.
     2. LLM fallback — for unknown rule IDs that have no registered strategy.
 
-    Implements the VIGIL pattern:
-    - Classify errors by type
-    - Generate targeted patches (not full regeneration)
-    - Reset only affected validators
+    Progressive disclosure
+    ----------------------
+    L1  metadata — always resident
+    L2  yaml     — imported lazily in load_level2()
+    L3  (none)
     """
 
     REMEDIATION_STRATEGIES: dict[str, Callable] = {}
@@ -56,19 +58,30 @@ class RemediationSkill(Skill):
             "CKV_AWS_56": self._fix_lambda_timeout,
         }
 
-    def _define_metadata(self) -> SkillMetadata:           # ← no underscore
+    def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
             name="remediation",
-            description="Analyzes validation failures and applies targeted fixes",
+            version="1.1.0",
+            description=(
+                "Analyzes validation failures and applies targeted fixes. "
+                "Uses deterministic patches for known rule IDs and LLM fallback "
+                "for unknown rules."
+            ),
+            llm_description=(
+                "When deterministic strategies are exhausted, sends the full "
+                "template and remaining findings to the LLM and asks for a "
+                "corrected YAML output."
+            ),
             phase=SkillPhase.REMEDIATION,
-            trigger_condition="Any validation has failed",
+            trigger_condition="Any validation has FAILED (god.has_failed_validations() is True)",
             writes_to=["template.body", "template.resources", "remediation_log"],
             reads_from=["template.body", "validation_state"],
             priority=10,
+            tags=["remediation", "deterministic", "llm-fallback"],
         )
 
+    # L2: lazy-import yaml
     def load_level2(self) -> bool:
-        """Lazy-import yaml once at activation, not per execute call."""
         if not self._level2_loaded:
             import yaml as _yaml
             self._yaml = _yaml
@@ -82,19 +95,18 @@ class RemediationSkill(Skill):
         god = context.god
         skill_result = SkillResult(success=True, skill_name=self.metadata.name)
         round_num = god.get_remediation_round() + 1
-        self._logger.info(f"Remediation round {round_num}") 
+        self._logger.info(f"Remediation round {round_num}")
 
         blocking_findings = god.get_blocking_findings()
         if not blocking_findings:
             skill_result.warnings.append("No blocking findings to remediate")
             return skill_result
 
-        # --- Parse template -----------------------------------------------
         try:
             template = self._yaml.safe_load(god.template.body)
-        except Exception as e:
+        except Exception as exc:
             skill_result.success = False
-            skill_result.errors.append(f"Cannot parse template: {e}")
+            skill_result.errors.append(f"Cannot parse template: {exc}")
             return skill_result
 
         resources = template.get("Resources", {})
@@ -102,7 +114,6 @@ class RemediationSkill(Skill):
         findings_addressed: list[str] = []
         unknown_findings: list[ValidationFinding] = []
 
-        # --- Group findings by resource -----------------------------------
         findings_by_resource: dict[str, list[ValidationFinding]] = {}
         for finding in blocking_findings:
             findings_by_resource.setdefault(finding.resource_name, []).append(finding)
@@ -120,21 +131,19 @@ class RemediationSkill(Skill):
                 rule_id = finding.rule_id
                 if rule_id in self.REMEDIATION_STRATEGIES:
                     try:
-                        fix_description = self.REMEDIATION_STRATEGIES[rule_id](
-                            properties, finding
-                        )
-                        if fix_description:
-                            fixes_applied.append(f"{res_name}: {fix_description}")
+                        fix_desc = self.REMEDIATION_STRATEGIES[rule_id](properties, finding)
+                        if fix_desc:
+                            fixes_applied.append(f"{res_name}: {fix_desc}")
                             findings_addressed.append(rule_id)
                             self._logger.info(f"  Fixed {rule_id} on {res_name}")
-                    except Exception as e:
-                        self._logger.warning(f"  Failed to fix {rule_id}: {e}")
-                        unknown_findings.append(finding)   # retry via LLM
+                    except Exception as exc:
+                        self._logger.warning(f"  Failed to apply fix {rule_id}: {exc}")
+                        unknown_findings.append(finding)
                 else:
                     self._logger.warning(f"  No deterministic strategy for {rule_id}")
                     unknown_findings.append(finding)
 
-        # --- Tier 2: LLM fallback for unknown rule IDs --------------------
+        # --- Tier 2: LLM fallback -----------------------------------------
         llm: Optional[OpenRouterClient] = context.get_config("llm")
         if unknown_findings and llm is not None:
             findings_text = "\n".join(
@@ -150,25 +159,29 @@ class RemediationSkill(Skill):
                         "Return ONLY the complete fixed YAML template. "
                         "Do not add comments or explanations."
                     ),
-                    user=f"Template:\n{god.template.body}\n\nFindings:\n{findings_text}",
+                    user=(
+                        f"Template:\n{god.template.body}\n\n"
+                        f"Findings:\n{findings_text}"
+                    ),
                     temperature=0.0,
                 )
-                # Guard: validate YAML before committing
-                self._yaml.safe_load(fixed_yaml)
-                template = self._yaml.safe_load(fixed_yaml)   # re-parse from LLM output
+                self._yaml.safe_load(fixed_yaml)  # validate before committing
+                template = self._yaml.safe_load(fixed_yaml)
                 resources = template.get("Resources", {})
                 for f in unknown_findings:
                     findings_addressed.append(f.rule_id)
                     fixes_applied.append(f"{f.resource_name}: LLM fixed {f.rule_id}")
-                self._logger.info(f"  LLM remediated {len(unknown_findings)} unknown findings")
-            except self._yaml.YAMLError as e:
-                skill_result.warnings.append(
-                    f"LLM remediation produced invalid YAML ({e}); skipped"
+                self._logger.info(
+                    f"  LLM remediated {len(unknown_findings)} unknown findings"
                 )
-            except Exception as e:
-                skill_result.warnings.append(f"LLM fallback failed: {e}")
+            except self._yaml.YAMLError as exc:
+                skill_result.warnings.append(
+                    f"LLM remediation produced invalid YAML ({exc}); skipped"
+                )
+            except Exception as exc:
+                skill_result.warnings.append(f"LLM fallback failed: {exc}")
 
-        # --- Commit or escalate -------------------------------------------
+        # --- Commit -------------------------------------------------------
         if fixes_applied:
             try:
                 god.template.body = self._yaml.dump(
@@ -190,13 +203,12 @@ class RemediationSkill(Skill):
                 ))
                 skill_result.changes_made = fixes_applied
 
-            except Exception as e:
+            except Exception as exc:
                 skill_result.success = False
-                skill_result.errors.append(f"Failed to serialize fixed template: {e}")
+                skill_result.errors.append(f"Failed to serialize fixed template: {exc}")
                 return skill_result
 
-        # --- Escalate anything still unresolved ---------------------------
-        # Computed AFTER commit attempt so partial fixes are counted correctly
+        # --- Escalate remaining -------------------------------------------
         remaining = [
             f for f in blocking_findings if f.rule_id not in findings_addressed
         ]
@@ -219,9 +231,9 @@ class RemediationSkill(Skill):
 
         return skill_result
 
-    # ---- Fix strategies (unchanged from existing file) -------------------
+    # ---- Deterministic fix strategies ------------------------------------
 
-    def _fix_s3_encryption(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_s3_encryption(self, props: dict, _: ValidationFinding) -> str:
         props["BucketEncryption"] = {
             "ServerSideEncryptionConfiguration": [
                 {"ServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}
@@ -229,7 +241,7 @@ class RemediationSkill(Skill):
         }
         return "Added server-side encryption AES256"
 
-    def _fix_s3_public_access(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_s3_public_access(self, props: dict, _: ValidationFinding) -> str:
         props["PublicAccessBlockConfiguration"] = {
             "BlockPublicAcls": True,
             "BlockPublicPolicy": True,
@@ -238,85 +250,67 @@ class RemediationSkill(Skill):
         }
         return "Added public access block configuration"
 
-    def _fix_s3_versioning(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_s3_versioning(self, props: dict, _: ValidationFinding) -> str:
         props["VersioningConfiguration"] = {"Status": "Enabled"}
         return "Enabled versioning"
 
-    def _fix_rds_encryption(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_rds_encryption(self, props: dict, _: ValidationFinding) -> str:
         props["StorageEncrypted"] = True
         return "Enabled storage encryption"
 
-    def _fix_rds_public_access(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_rds_public_access(self, props: dict, _: ValidationFinding) -> str:
         props["PubliclyAccessible"] = False
         return "Disabled public accessibility"
 
-    def _fix_rds_multi_az(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_rds_multi_az(self, props: dict, _: ValidationFinding) -> str:
         props["MultiAZ"] = True
         return "Enabled Multi-AZ"
 
-    def _fix_vpc_dns_support(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_vpc_dns_support(self, props: dict, _: ValidationFinding) -> str:
         props["EnableDnsSupport"] = True
         return "Enabled DNS support"
 
-    def _fix_vpc_dns_hostnames(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_vpc_dns_hostnames(self, props: dict, _: ValidationFinding) -> str:
         props["EnableDnsHostnames"] = True
         return "Enabled DNS hostnames"
 
-    def _fix_sg_description(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_sg_description(self, props: dict, _: ValidationFinding) -> str:
         if not props.get("GroupDescription"):
             props["GroupDescription"] = "Security group managed by INFRA-SKILL"
         return "Added group description"
 
-    def _fix_sg_ssh_ingress(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_sg_ssh_ingress(self, props: dict, _: ValidationFinding) -> str:
         ingress = props.get("SecurityGroupIngress", [])
         props["SecurityGroupIngress"] = [
             rule for rule in ingress
-            if not (rule.get("CidrIp") == "0.0.0.0/0"
-                    and rule.get("FromPort", 0) == 22)
+            if not (
+                rule.get("CidrIp") == "0.0.0.0/0"
+                and rule.get("FromPort", 0) == 22
+            )
         ]
         return "Removed unrestricted SSH (0.0.0.0/0:22) ingress rule"
 
-    def _fix_sg_rdp_ingress(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_sg_rdp_ingress(self, props: dict, _: ValidationFinding) -> str:
         ingress = props.get("SecurityGroupIngress", [])
         props["SecurityGroupIngress"] = [
             rule for rule in ingress
-            if not (rule.get("CidrIp") == "0.0.0.0/0"
-                    and rule.get("FromPort", 0) == 3389)
+            if not (
+                rule.get("CidrIp") == "0.0.0.0/0"
+                and rule.get("FromPort", 0) == 3389
+            )
         ]
         return "Removed unrestricted RDP (0.0.0.0/0:3389) ingress rule"
 
-    def _fix_subnet_public_ip(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_subnet_public_ip(self, props: dict, _: ValidationFinding) -> str:
         props["MapPublicIpOnLaunch"] = False
         return "Disabled auto-assign public IP"
 
-    def _fix_lambda_memory(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_lambda_memory(self, props: dict, _: ValidationFinding) -> str:
         if "MemorySize" not in props:
             props["MemorySize"] = 256
         return "Set memory size to 256MB"
 
-    def _fix_lambda_timeout(self, props: dict, finding: ValidationFinding) -> str:
+    def _fix_lambda_timeout(self, props: dict, _: ValidationFinding) -> str:
         if "Timeout" not in props:
             props["Timeout"] = 30
         return "Set timeout to 30s"
-
-def execute(self, context: SkillContext) -> SkillResult:
-    god = context.god
-    result = SkillResult(success=True, skill_name=self.metadata.name)
-    llm: Optional[OpenRouterClient] = context.get_config("llm")
-    findings = god.get_blocking_findings()
-
-    findings_text = "\n".join(
-        f"- [{f.severity.name}] {f.rule_id} on {f.resource_name}: "
-        f"{f.message}. Fix: {f.remediation_hint}"
-        for f in findings
-    )
-    fixed = llm.complete(
-        system="You are a CloudFormation security expert. Fix ALL findings. Return ONLY the fixed YAML.",
-        user=f"Template:\n{god.template.body}\n\nFindings:\n{findings_text}",
-        temperature=0.0,
-    )
-    god.template.body = fixed.strip()
-    god.template.increment_version(self.metadata.name)
-    god.reset_validations_from("yaml_syntax", self.metadata.name)
-    result.changes_made.append(f"LLM remediated {len(findings)} findings")
-    return result
