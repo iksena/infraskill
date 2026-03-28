@@ -5,8 +5,9 @@ import time
 from typing import Optional
 import urllib.request
 import urllib.error
+from dotenv import load_dotenv
 
-
+load_dotenv()  # Load environment variables from .env file
 class LLMResponse:
     """Structured response from an LLM call, including usage metadata."""
 
