@@ -61,6 +61,7 @@ class ValidationResult:
     duration_ms: float = 0
     tool_version: str = ""
     raw_output: str = ""
+    metrics: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -240,9 +241,9 @@ class RemediationEntry:
     """
     A single remediation action in the audit log.
 
-    strategy_type is new in v2: records whether the action was produced by
-    a deterministic rule, llm_fallback, llm_plan, or an escalation.  Benchmark
-    telemetry reads this field to compute per-strategy success rates.
+    strategy_type records whether the action was produced by a deterministic
+    rule, llm_fallback, llm_plan, or an escalation.  Benchmark telemetry reads
+    this field to compute per-strategy success rates.
     """
     round: int
     skill_name: str
@@ -253,7 +254,7 @@ class RemediationEntry:
     findings_addressed: list[str]
     success: bool = False
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    strategy_type: str = "unknown"  # NEW: 'deterministic'|'llm_fallback'|'llm_plan'|'escalate'
+    strategy_type: str = "unknown"  # 'deterministic'|'llm_fallback'|'llm_plan'|'escalate'
 
     def to_dict(self) -> dict:
         return {
@@ -345,9 +346,34 @@ class GroundedObjectivesDocument:
         )
 
     def has_failed_validations(self) -> bool:
-        """True when any validator is in FAIL or ERROR status."""
+        """True when any validator is FAIL **or** ERROR (either blocks progress)."""
         return any(
             v.status.blocks_progress()
+            for v in self.validation_state.values()
+        )
+
+    def has_remediable_failures(self) -> bool:
+        """
+        True when at least one validator is in FAIL status AND that validator
+        has blocking findings (CRITICAL or HIGH severity).
+
+        This is the correct predicate for routing to REMEDIATING.  It
+        deliberately excludes ERROR status (tool not on PATH) because:
+          - ERROR validators produce no findings, only an errors[] string list.
+          - Remediation has nothing to patch — it would return immediately with
+            an empty fixes_applied list, commit no changes, and loop forever.
+          - Missing tools are a deployment/environment issue, not a template
+            correctness issue; they should be logged and skipped.
+        """
+        return any(
+            v.status == ValidationStatus.FAIL and v.has_blocking_findings()
+            for v in self.validation_state.values()
+        )
+
+    def has_error_validations(self) -> bool:
+        """True when any validator errored due to a missing or crashing tool."""
+        return any(
+            v.status == ValidationStatus.ERROR
             for v in self.validation_state.values()
         )
 
@@ -358,14 +384,29 @@ class GroundedObjectivesDocument:
         )
 
     def all_validations_passed(self) -> bool:
+        """
+        True when every validator has reached a non-blocking terminal state.
+
+        ERROR is treated the same as SKIPPED: the tool is absent from the
+        environment so we cannot run it, but that is not a reason to fail the
+        entire pipeline.  The orchestrator will log a warning separately via
+        has_error_validations().
+        """
         return all(
-            v.status in (ValidationStatus.PASS, ValidationStatus.SKIPPED)
+            v.status in (
+                ValidationStatus.PASS,
+                ValidationStatus.SKIPPED,
+                ValidationStatus.ERROR,
+            )
             for v in self.validation_state.values()
         )
 
     def get_blocking_findings(self) -> list[ValidationFinding]:
+        """Return CRITICAL/HIGH findings from FAIL validators only (not ERROR)."""
         findings = []
         for result in self.validation_state.values():
+            if result.status != ValidationStatus.FAIL:
+                continue
             findings.extend(
                 f for f in result.findings
                 if f.severity in (Severity.CRITICAL, Severity.HIGH)
