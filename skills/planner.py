@@ -15,9 +15,8 @@ from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
 
 # ---------------------------------------------------------------------------
 # Offline regex fallback constants
+# Used ONLY when no LLM client is configured (unit tests / CI).
 # ---------------------------------------------------------------------------
-# These are used ONLY when no LLM client is configured (unit tests, CI).
-# All production runs use the LLM path.
 
 _RESOURCE_PATTERNS: dict[str, tuple[str, int]] = {
     r'\b(vpc|virtual private cloud)\b':           ('AWS::EC2::VPC', 10),
@@ -65,20 +64,16 @@ class PlannerSkill(Skill):
     ------------------
     1. LLM path (default when an LLM client is configured) — single structured
        JSON call to extract resources, constraints AND acceptance criteria in
-       one shot.  Regex fallback is attempted only on JSON decode errors.
-    2. Offline regex path — used when no LLM client is present (CI / unit tests).
-
-    Progressive disclosure
-    ----------------------
-    L1  metadata  — always resident (routing)
-    L2  imports   — ``re`` module imported lazily in load_level2()
-    L3  (none)    — no heavy assets needed
+       one shot.  On JSON parse failure a single correction retry is attempted
+       before giving up with an error.
+    2. Offline regex path — used ONLY when no LLM client is present (CI /
+       unit tests).  Never triggered when an LLM is configured.
     """
 
     def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
             name="planner",
-            version="2.0.0",
+            version="2.1.0",
             description=(
                 "Transforms a natural-language infrastructure prompt into a "
                 "machine-checkable GOD specification: resource list, constraints, "
@@ -104,21 +99,8 @@ class PlannerSkill(Skill):
             reads_from=["intent.raw_prompt"],
             priority=10,
             tags=["llm", "planning", "extraction"],
-            examples=[
-                {
-                    "input": "Create a private S3 bucket with versioning for production",
-                    "output": {
-                        "resources": [{"resource_type": "AWS::S3::Bucket", "logical_name": "MainS3Bucket", "priority": 30}],
-                        "constraints": {"environment": "production", "public_access_allowed": False},
-                        "acceptance_criteria": [{"id": "AC-1", "description": "S3 bucket blocks public ACLs", "check_type": "equals"}],
-                    },
-                }
-            ],
         )
 
-    # ------------------------------------------------------------------
-    # L2: lazy-import re so the L1 metadata load is zero-cost
-    # ------------------------------------------------------------------
     def load_level2(self) -> bool:
         if not self._level2_loaded:
             import re as _re
@@ -130,7 +112,7 @@ class PlannerSkill(Skill):
         return bool(god.intent.raw_prompt) and not god.intent.resources
 
     # ------------------------------------------------------------------
-    # Main execute — LLM-first, regex fallback
+    # Main execute
     # ------------------------------------------------------------------
     def execute(self, context: SkillContext) -> SkillResult:
         god = context.god
@@ -146,11 +128,15 @@ class PlannerSkill(Skill):
             user=god.intent.raw_prompt,
             temperature=0.0,
         )
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            self._logger.warning(f"LLM returned invalid JSON ({exc}); falling back to regex.")
-            return self._execute_regex(context)
+
+        data = self._parse_json_with_retry(raw, god.intent.raw_prompt, llm)
+        if data is None:
+            result.success = False
+            result.errors.append(
+                "Planner LLM did not return valid JSON after retry. "
+                "Check model availability or prompt."
+            )
+            return result
 
         god.intent.resources = [ExtractedResource(**r) for r in data["resources"]]
         god.intent.constraints = Constraints(**data["constraints"])
@@ -169,13 +155,65 @@ class PlannerSkill(Skill):
         return result
 
     # ------------------------------------------------------------------
-    # Offline regex fallback (no LLM)
+    # JSON parse with single correction retry
+    # ------------------------------------------------------------------
+    def _parse_json_with_retry(
+        self,
+        raw: str,
+        original_prompt: str,
+        llm: OpenRouterClient,
+    ) -> Optional[dict]:
+        """Attempt to parse JSON; on failure, ask the LLM to correct it once."""
+        import re as _re
+
+        # Strip optional markdown fences
+        cleaned = _re.sub(
+            r'^```[\w]*\n?|\n?```$', '', raw.strip(), flags=_re.MULTILINE
+        ).strip()
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            self._logger.warning(
+                f"LLM returned invalid JSON ({exc}); retrying with correction prompt."
+            )
+
+        # Single retry: send the bad output back and ask for pure JSON
+        try:
+            corrected = llm.complete(
+                system=(
+                    "Your previous response was not valid JSON. "
+                    "Return ONLY a valid JSON object — no markdown, no prose, no code fences. "
+                    "The JSON must match the schema in the original system prompt."
+                ),
+                user=(
+                    f"Original request: {original_prompt}\n\n"
+                    f"Your previous (invalid) response:\n{raw[:2000]}\n\n"
+                    "Please return ONLY the corrected JSON object."
+                ),
+                temperature=0.0,
+            )
+            corrected_clean = _re.sub(
+                r'^```[\w]*\n?|\n?```$', '', corrected.strip(), flags=_re.MULTILINE
+            ).strip()
+            return json.loads(corrected_clean)
+        except json.JSONDecodeError as exc2:
+            self._logger.error(
+                f"LLM correction retry also returned invalid JSON ({exc2}). Giving up."
+            )
+            return None
+        except Exception as exc2:
+            self._logger.error(f"LLM correction retry failed: {exc2}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Offline regex fallback (no LLM only)
     # ------------------------------------------------------------------
     def _execute_regex(self, context: SkillContext) -> SkillResult:
         """Regex-based planner used only when no LLM client is configured."""
         god = context.god
         result = SkillResult(success=True, skill_name=self.metadata.name)
-        self.load_level2()  # ensure self._re is available
+        self.load_level2()
 
         prompt = god.intent.raw_prompt.lower()
         god.intent.normalized_prompt = prompt
@@ -198,7 +236,7 @@ class PlannerSkill(Skill):
         return result
 
     # ------------------------------------------------------------------
-    # Dependency resolution (shared by both paths)
+    # Dependency resolution (shared)
     # ------------------------------------------------------------------
     def _resolve_dependencies(
         self, resources: list[ExtractedResource]
@@ -224,7 +262,6 @@ class PlannerSkill(Skill):
                         ))
                         current_types.add(dep_type)
                         changed = True
-                        self._logger.debug(f"Added dependency: {dep_type}")
                     if dep_type not in resource.dependencies:
                         resource.dependencies.append(dep_type)
 

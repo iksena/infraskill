@@ -51,6 +51,11 @@ Database = 40-49, Compute = 50-59, Application = 60-69, Monitoring = 70-79.
 - Set `multi_az` to true for production environments unless cost_optimization is true.
 - Each acceptance criterion must be a binary, machine-checkable assertion on a single CFN property.
 - Generate at least one acceptance criterion per resource.
+- IMPORTANT: Include ALL resources that are implicitly required.
+  For example, an SNS topic with email subscription requires BOTH AWS::SNS::Topic AND
+  AWS::SNS::Subscription. A Lambda triggered by SQS requires the Lambda, the SQS queue,
+  and an AWS::Lambda::EventSourceMapping. Always think about what companion resources
+  are needed to fulfil the intent, not just the primary resource.
 """
 
 ENGINEER_SYSTEM_PROMPT = """\
@@ -74,7 +79,7 @@ Generate a valid CloudFormation resource block in YAML for:
   logging_enabled        : {logging_enabled}
   compliance_frameworks  : {compliance_frameworks}
 
-## Resources already in the template (use !Ref / !GetAtt to reference these)
+## Resources already in the template (reference using Fn:: forms below)
 
 {existing_refs}
 
@@ -82,8 +87,22 @@ Generate a valid CloudFormation resource block in YAML for:
 
 - Output ONLY the YAML block. Start with the logical name as the root key.
 - No markdown fences, no explanation, no comments.
-- Use !Sub "${{AWS::StackName}}-<suffix>" for Name tags.
-- Use !Ref <LogicalName> to reference sibling resources listed above.
+- CRITICAL — DO NOT use YAML tag shorthand. These tags crash the YAML parser:
+    FORBIDDEN: !Ref, !Sub, !GetAtt, !Select, !Join, !If, !Equals, !Split,
+               !FindInMap, !Base64, !Condition, !ImportValue, !Transform
+  Use the equivalent Fn:: dict form instead:
+    !Ref LogicalName           -> {{Ref: LogicalName}}
+    !Sub 'string ${{Var}}'    -> {{Fn::Sub: 'string ${{Var}}'}}
+    !GetAtt Res.Attr           -> {{Fn::GetAtt: [Res, Attr]}}
+    !Select [0, list]          -> {{Fn::Select: [0, list]}}
+    !Join [",", list]          -> {{Fn::Join: [",", list]}}
+    !If [cond, a, b]           -> {{Fn::If: [cond, a, b]}}
+    !Split [",", str]          -> {{Fn::Split: [",", str]}}
+    !FindInMap [M, K1, K2]     -> {{Fn::FindInMap: [M, K1, K2]}}
+    !Base64 value              -> {{Fn::Base64: value}}
+    !ImportValue export        -> {{Fn::ImportValue: export}}
+- Use {{Fn::Sub: "${{AWS::StackName}}-<suffix>"}} for Name tags.
+- Use {{Ref: <LogicalName>}} to reference sibling resources listed above.
 - Apply the constraints above — do not add properties that contradict them.
 - Follow AWS security best practices: least-privilege IAM, no 0.0.0.0/0 ingress unless \
   public_access_allowed is true, encryption enabled where supported.
