@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Callable
@@ -61,6 +62,11 @@ class OrchestratorConfig:
     log_god_snapshots: bool = False
     
     # Execution
+    # skill_timeout_seconds: hard wall-clock limit per skill execution.
+    # If a skill (including its internal LLM calls) exceeds this, the
+    # orchestrator treats it as a failure and continues the pipeline.
+    # The LLM client has its own per-request timeout (default 90s) which
+    # should be <= skill_timeout_seconds.
     skill_timeout_seconds: int = 120
 
     llm_client: Optional[object] = None  
@@ -226,7 +232,7 @@ class Orchestrator:
         
         self._state_history.append((new_state, reason, timestamp))
         
-        self._logger.info(f"State: {old_state.name} → {new_state.name}" + (f" ({reason})" if reason else ""))
+        self._logger.info(f"State: {old_state.name} \u2192 {new_state.name}" + (f" ({reason})" if reason else ""))
         
         self.events.emit(OrchestratorEventType.STATE_CHANGED, {
             "old_state": old_state.name,
@@ -319,11 +325,10 @@ class Orchestrator:
 
         llm = self.config.llm_client
         if llm is None:
-            # Graceful fallback to deterministic routing if no LLM configured
             self._logger.warning("No LLM client — falling back to priority-based routing")
             return triggerable[0]
 
-        god_snapshot = json.dumps(self.god.intent.to_dict(), indent=2)[:2000]  # truncate
+        god_snapshot = json.dumps(self.god.intent.to_dict(), indent=2)[:2000]
         skill_table = json.dumps(self.registry.get_metadata_table(), indent=2)
 
         try:
@@ -334,6 +339,7 @@ class Orchestrator:
                 ),
                 user="Which skill should run next?",
                 temperature=0.0,
+                timeout=15,  # skill selector must be fast
             )
             decision = json.loads(raw)
             chosen_name = decision["skill_name"]
@@ -341,28 +347,25 @@ class Orchestrator:
 
             skill = self.registry.get(chosen_name)
             if skill and skill.can_trigger(self.god):
-                self._logger.info(
-                    f"LLM selected skill '{chosen_name}': {rationale}"
-                )
+                self._logger.info(f"LLM selected skill '{chosen_name}': {rationale}")
                 return skill
 
-            # LLM hallucinated a skill name or chose a non-triggerable skill
             self._logger.warning(
-                f"LLM chose invalid skill '{chosen_name}', "
-                f"falling back to priority routing"
+                f"LLM chose invalid skill '{chosen_name}', falling back to priority routing"
             )
             return triggerable[0]
 
         except (json.JSONDecodeError, KeyError) as e:
             self._logger.warning(f"Skill selector LLM failed ({e}), using priority fallback")
             return triggerable[0]
+        except (TimeoutError, RuntimeError) as e:
+            self._logger.warning(f"Skill selector LLM timed out ({e}), using priority fallback")
+            return triggerable[0]
     
     def _check_phase_advancement(self, current_phase: SkillPhase) -> Optional[Skill]:
         """Check if we should advance to the next phase and return a skill from it"""
         
-        # Phase advancement rules
         if current_phase == SkillPhase.ENGINEERING:
-            # All engineering done, move to assembly
             assembly_skills = self.registry.get_by_phase(SkillPhase.ASSEMBLY)
             for skill in assembly_skills:
                 if skill.can_trigger(self.god):
@@ -370,7 +373,6 @@ class Orchestrator:
                     return skill
         
         elif current_phase == SkillPhase.ASSEMBLY:
-            # Assembly done, move to validation
             self._transition_to(OrchestratorState.VALIDATING, "assembly complete")
             validation_skills = self.registry.get_by_phase(SkillPhase.VALIDATION)
             for skill in validation_skills:
@@ -378,7 +380,6 @@ class Orchestrator:
                     return skill
         
         elif current_phase == SkillPhase.VALIDATION:
-            # Check if all validations passed or if we need remediation
             if self.god.all_validations_passed():
                 self._transition_to(OrchestratorState.SUCCEEDED, "all validations passed")
             elif self.god.has_failed_validations():
@@ -389,7 +390,6 @@ class Orchestrator:
                         return skill
         
         elif current_phase == SkillPhase.REMEDIATION:
-            # After remediation, go back to validation
             self._transition_to(OrchestratorState.VALIDATING, "remediation complete")
             validation_skills = self.registry.get_by_phase(SkillPhase.VALIDATION)
             for skill in validation_skills:
@@ -399,13 +399,33 @@ class Orchestrator:
         return None
     
     def _execute_skill(self, skill: Skill) -> SkillResult:
-        """Execute a skill with full lifecycle management"""
-        
+        """
+        Execute a skill with full lifecycle management.
+
+        Timeout enforcement
+        -------------------
+        skill.execute() runs inside a ThreadPoolExecutor with a hard deadline
+        of config.skill_timeout_seconds.  If it exceeds that, we:
+          1. Log a clear timeout warning.
+          2. Return a SkillResult.failure so the pipeline can react
+             (escalate, retry, or continue) rather than hang indefinitely.
+
+        The background thread may keep running after the timeout (Python
+        threads cannot be forcibly killed), but the main pipeline is
+        unblocked immediately.  LLM calls inside skills will eventually
+        be cleaned up by their own socket-level timeout.
+        """
+        timeout_s = self.config.skill_timeout_seconds
+
         context = SkillContext(
             god=self.god,
             orchestrator_state=self.state,
             iteration=self._iteration,
-            config={"llm": self.config.llm_client}
+            config={
+                "llm": self.config.llm_client,
+                # Forward timeout so skills can pass it to fine-grained LLM calls
+                "llm_timeout": max(30, timeout_s - 10),
+            }
         )
         
         self.events.emit(OrchestratorEventType.SKILL_STARTED, {
@@ -419,16 +439,34 @@ class Orchestrator:
         # Pre-execution check
         can_proceed, abort_reason = skill.pre_execute(context)
         if not can_proceed:
-            result = SkillResult.failure(skill.metadata.name, f"Pre-execution failed: {abort_reason}")
+            result = SkillResult.failure(
+                skill.metadata.name, f"Pre-execution failed: {abort_reason}"
+            )
             result.duration_ms = (datetime.now() - start_time).total_seconds() * 1000
             self._record_execution(skill, result)
             return result
         
-        # Execute
+        # Execute with hard timeout
+        result: SkillResult
         try:
-            result = skill.execute(context)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(skill.execute, context)
+                try:
+                    result = future.result(timeout=timeout_s)
+                except FuturesTimeoutError:
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    self._logger.error(
+                        f"Skill '{skill.metadata.name}' timed out after "
+                        f"{elapsed:.1f}s (limit={timeout_s}s)"
+                    )
+                    result = SkillResult.failure(
+                        skill.metadata.name,
+                        f"Skill timed out after {timeout_s}s"
+                    )
         except Exception as e:
-            self._logger.error(f"Skill {skill.metadata.name} raised exception: {e}")
+            self._logger.error(
+                f"Skill {skill.metadata.name} raised exception: {e}"
+            )
             self._logger.debug(traceback.format_exc())
             result = SkillResult.failure(skill.metadata.name, f"Exception: {str(e)}")
         
@@ -476,33 +514,20 @@ class Orchestrator:
     def run(self, user_prompt: str) -> dict:
         """
         Execute the full pipeline for a user prompt.
-        
-        This is the main entry point. It:
-        1. Initializes the GOD with the user prompt
-        2. Runs the skill selection/execution loop
-        3. Returns a result dictionary
-        
-        Args:
-            user_prompt: Natural language description of desired infrastructure
-            
-        Returns:
-            Result dictionary with success status, template, and audit trail
         """
         self._logger.info("=" * 70)
         self._logger.info("INFRA-SKILL Pipeline Starting")
         self._logger.info("=" * 70)
         self._logger.info(f"Prompt: {user_prompt[:100]}{'...' if len(user_prompt) > 100 else ''}")
         
-        # Initialize
         self._start_time = datetime.now()
         self._iteration = 0
         self._execution_log = []
         self._state_history = []
         
-        # Create and initialize GOD
         self.god = GroundedObjectivesDocument()
         self.god.intent.raw_prompt = user_prompt
-        self.god.lock_field("intent.raw_prompt", "orchestrator")  # Immutable
+        self.god.lock_field("intent.raw_prompt", "orchestrator")
         self.god.save_checkpoint("initialized", "orchestrator")
         
         self._transition_to(OrchestratorState.INITIALIZING, "pipeline start")
@@ -512,7 +537,6 @@ class Orchestrator:
             "registered_skills": len(self.registry)
         })
         
-        # Main execution loop
         self._transition_to(OrchestratorState.PLANNING, "initialization complete")
         
         while self._iteration < self.config.max_total_iterations:
@@ -521,18 +545,14 @@ class Orchestrator:
             if self.config.verbose_logging:
                 self._log_iteration_status()
             
-            # Check terminal states
             if self.state.is_terminal():
                 self._logger.info(f"Terminal state reached: {self.state.name}")
                 break
             
-            # Select next skill
             skill = self.select_next_skill()
             
             if skill is None:
                 self._logger.info("No skill can trigger")
-                
-                # Determine final state
                 if self.god.all_validations_passed():
                     self._transition_to(OrchestratorState.SUCCEEDED, "all validations passed")
                 elif self.god.has_failed_validations():
@@ -547,28 +567,27 @@ class Orchestrator:
                     self._transition_to(OrchestratorState.FAILED, "pipeline stuck - no triggerable skills")
                 break
             
-            # Execute skill
             self._logger.info(f"Executing: {skill.metadata.name}")
             result = self._execute_skill(skill)
             
-            # Handle special results
             if result.requires_human_review:
-                self._transition_to(OrchestratorState.ESCALATED, result.escalation_reason or "human review required")
+                self._transition_to(
+                    OrchestratorState.ESCALATED,
+                    result.escalation_reason or "human review required"
+                )
                 self.events.emit(OrchestratorEventType.ESCALATION_REQUIRED, {
                     "skill_name": skill.metadata.name,
                     "reason": result.escalation_reason
                 })
                 break
             
-            # Log result
             if result.success:
                 for change in result.changes_made:
-                    self._logger.info(f"  ✓ {change}")
+                    self._logger.info(f"  \u2713 {change}")
             else:
                 for error in result.errors:
-                    self._logger.warning(f"  ✗ {error}")
+                    self._logger.warning(f"  \u2717 {error}")
         
-        # Finalize
         self._end_time = datetime.now()
         
         self.events.emit(OrchestratorEventType.PIPELINE_COMPLETED, {
@@ -580,47 +599,32 @@ class Orchestrator:
         return self._build_result()
     
     def _log_iteration_status(self):
-        """Log current iteration status"""
-        self._logger.info(f"\n{'─' * 50}")
+        self._logger.info(f"\n{'\u2500' * 50}")
         self._logger.info(f"Iteration {self._iteration} | State: {self.state.name}")
         self._logger.info(f"Validations: {self.god.get_validation_summary()}")
         self._logger.info(f"Remediation Rounds: {self.god.get_remediation_round()}")
     
     def _build_result(self) -> dict:
-        """Build the final result dictionary"""
         success = self.state == OrchestratorState.SUCCEEDED
-        
         duration_ms = 0
         if self._start_time and self._end_time:
             duration_ms = (self._end_time - self._start_time).total_seconds() * 1000
-        
         return {
-            # Status
             "success": success,
             "state": self.state.name,
-            
-            # Output
             "template": self.god.template.body if success else None,
             "template_checksum": self.god.template.checksum if success else None,
-            
-            # Metrics
             "iterations": self._iteration,
             "duration_ms": duration_ms,
             "remediation_rounds": self.god.get_remediation_round(),
-            
-            # Validation summary
             "validation_summary": self.god.get_validation_summary(),
             "findings_summary": self.god.get_findings_summary(),
             "blocking_findings": [f.to_dict() for f in self.god.get_blocking_findings()],
-            
-            # Audit trail
             "execution_log": self._execution_log,
             "state_history": [
                 {"state": s.name, "reason": r, "timestamp": t}
                 for s, r, t in self._state_history
             ],
-            
-            # Full GOD state (for debugging)
             "god_snapshot": self.god.snapshot() if self.config.log_god_snapshots else None
         }
     
@@ -629,7 +633,6 @@ class Orchestrator:
     # -------------------------------------------------------------------------
     
     def get_status(self) -> dict:
-        """Get current orchestrator status"""
         return {
             "state": self.state.name,
             "iteration": self._iteration,
@@ -640,11 +643,9 @@ class Orchestrator:
         }
     
     def print_skill_registry(self):
-        """Print registered skills in a formatted table"""
         print("\n" + "=" * 70)
         print("REGISTERED SKILLS")
         print("=" * 70)
-        
         for phase in SkillPhase:
             skills = self.registry.get_by_phase(phase)
             if skills:
@@ -653,80 +654,55 @@ class Orchestrator:
                 for skill in skills:
                     m = skill.metadata
                     print(f"  [{m.priority:3}] {m.name:25} - {m.description[:40]}")
-        
         print("\n" + "=" * 70)
     
     def print_result(self, result: dict):
-        """Print a formatted result summary"""
         print("\n" + "=" * 70)
         print("PIPELINE RESULT")
         print("=" * 70)
-        
-        status_icon = "✓" if result["success"] else "✗"
+        status_icon = "\u2713" if result["success"] else "\u2717"
         status_color = "\033[32m" if result["success"] else "\033[31m"
         reset = "\033[0m"
-        
         print(f"\nStatus: {status_color}{status_icon} {result['state']}{reset}")
         print(f"Iterations: {result['iterations']}")
         print(f"Duration: {result['duration_ms']:.1f}ms")
         print(f"Remediation Rounds: {result['remediation_rounds']}")
-        
         print("\nValidation Summary:")
         for validator, status in result["validation_summary"].items():
-            icon = "✓" if status == "PASS" else ("✗" if status == "FAIL" else "○")
+            icon = "\u2713" if status == "PASS" else ("\u2717" if status == "FAIL" else "\u25cb")
             print(f"  {icon} {validator}: {status}")
-        
         print("\nFindings Summary:")
         for severity, count in result["findings_summary"].items():
             if count > 0:
                 print(f"  {severity}: {count}")
-        
         if result["blocking_findings"]:
             print("\nBlocking Findings:")
             for finding in result["blocking_findings"][:5]:
                 print(f"  [{finding['severity']}] {finding['rule_id']}: {finding['message']}")
-        
         if result["success"] and result["template"]:
             print("\nGenerated Template:")
             print("-" * 50)
-            # Print first 50 lines
             lines = result["template"].split("\n")
             for line in lines[:50]:
                 print(line)
             if len(lines) > 50:
                 print(f"... ({len(lines) - 50} more lines)")
-        
         print("\n" + "=" * 70)
+
 
 # =============================================================================
 # PART 8: SKILL FACTORY
 # =============================================================================
 
 def create_default_skills() -> list[Skill]:
-    """Create the default set of skills for AWS CloudFormation generation"""
     return [
-        # Planning
         PlannerSkill(),
-        
-        # Engineering
-        # VPCEngineerSkill(),
-        # SecurityGroupEngineerSkill(),
-        # IAMEngineerSkill(),
-        # S3EngineerSkill(),
-        # RDSEngineerSkill(),
-        # LambdaEngineerSkill(),
         GeneralEngineerSkill(),
-        
-        # Assembly
         TemplateAssemblerSkill(),
-        
-        # Validation
         YAMLSyntaxValidatorSkill(),
         CFNLintValidatorSkill(),
         CheckovValidatorSkill(),
         IntentAlignmentValidatorSkill(),
-        
-        # Remediation
         RemediationSkill(),
     ]
 
@@ -735,22 +711,10 @@ def create_orchestrator(
     config: OrchestratorConfig = None,
     skills: list[Skill] = None
 ) -> Orchestrator:
-    """
-    Factory function to create a fully configured orchestrator.
-    
-    Args:
-        config: Orchestrator configuration (uses defaults if not provided)
-        skills: List of skills to register (uses default set if not provided)
-    
-    Returns:
-        Configured Orchestrator instance
-    """
     config = config or OrchestratorConfig()
     skills = skills if skills is not None else create_default_skills()
-    
     orchestrator = Orchestrator(config)
     orchestrator.with_skills(skills)
-    
     return orchestrator
 
 
@@ -759,21 +723,18 @@ def create_orchestrator(
 # =============================================================================
 
 def demo_event_handler(event: OrchestratorEvent):
-    """Demo event handler that prints events"""
     icon = {
-        OrchestratorEventType.PIPELINE_STARTED: "🚀",
-        OrchestratorEventType.PIPELINE_COMPLETED: "🏁",
-        OrchestratorEventType.STATE_CHANGED: "⚡",
-        OrchestratorEventType.SKILL_STARTED: "▶️",
-        OrchestratorEventType.SKILL_COMPLETED: "✅",
-        OrchestratorEventType.SKILL_FAILED: "❌",
-        OrchestratorEventType.VALIDATION_GATE_PASSED: "✓",
-        OrchestratorEventType.VALIDATION_GATE_FAILED: "✗",
-        OrchestratorEventType.LOOP_GUARD_TRIGGERED: "⚠️",
-        OrchestratorEventType.ESCALATION_REQUIRED: "🚨",
-    }.get(event.event_type, "•")
-    
-    # Only print important events
+        OrchestratorEventType.PIPELINE_STARTED: "\U0001f680",
+        OrchestratorEventType.PIPELINE_COMPLETED: "\U0001f3c1",
+        OrchestratorEventType.STATE_CHANGED: "\u26a1",
+        OrchestratorEventType.SKILL_STARTED: "\u25b6\ufe0f",
+        OrchestratorEventType.SKILL_COMPLETED: "\u2705",
+        OrchestratorEventType.SKILL_FAILED: "\u274c",
+        OrchestratorEventType.VALIDATION_GATE_PASSED: "\u2713",
+        OrchestratorEventType.VALIDATION_GATE_FAILED: "\u2717",
+        OrchestratorEventType.LOOP_GUARD_TRIGGERED: "\u26a0\ufe0f",
+        OrchestratorEventType.ESCALATION_REQUIRED: "\U0001f6a8",
+    }.get(event.event_type, "\u2022")
     if event.event_type in [
         OrchestratorEventType.PIPELINE_STARTED,
         OrchestratorEventType.PIPELINE_COMPLETED,
@@ -785,41 +746,33 @@ def demo_event_handler(event: OrchestratorEvent):
 
 
 def main():
-    """Main entry point demonstrating the INFRA-SKILL orchestrator"""
-    
-    # Setup logging
     setup_logging(logging.INFO)
     logger = logging.getLogger("INFRA-SKILL.Main")
     
-    # Create orchestrator with default configuration
     config = OrchestratorConfig(
         max_remediation_rounds=5,
         max_total_iterations=30,
         verbose_logging=True,
         enable_checkpoints=True,
+        skill_timeout_seconds=120,
         llm_client=OpenRouterClient(
             model="arcee-ai/trinity-large-preview:free",
+            default_timeout=90,
+            max_retries=3,
         ),
     )
     
     orchestrator = create_orchestrator(config)
-    
-    # Register demo event handler
     orchestrator.on_event(OrchestratorEventType.PIPELINE_COMPLETED, demo_event_handler)
     orchestrator.on_event(OrchestratorEventType.ESCALATION_REQUIRED, demo_event_handler)
-    
-    # Print registered skills
     orchestrator.print_skill_registry()
     
-    # Example prompts
     prompts = [
         """
         Create a production VPC with multi-AZ subnets, an S3 bucket for application logs,
         and a PostgreSQL RDS database. The environment should be highly available,
         encrypted, and follow CIS security best practices. No public access should be allowed.
         """,
-        
-        # Additional examples (uncomment to try):
         "Create a simple S3 bucket for storing static assets with encryption enabled",
         "Set up a Lambda function with an IAM role for processing data",
         "Create a development VPC with a single subnet and basic security group",
@@ -831,55 +784,40 @@ def main():
         print("-" * 80)
         print(prompt.strip())
         print("=" * 80)
-        
-        # Run the pipeline
         result = orchestrator.run(prompt.strip())
-        
-        # Print results
         orchestrator.print_result(result)
-        
-        # Export template to file if successful
         if result["success"]:
             output_file = Path("generated_template.yaml")
             output_file.write_text(result["template"])
             logger.info(f"Template written to: {output_file}")
-            
-            # Also export the audit trail
             audit_file = Path("audit_trail.json")
-            audit_file.write_text(json.dumps(orchestrator.god.export_audit_trail(), indent=2))
+            audit_file.write_text(
+                json.dumps(orchestrator.god.export_audit_trail(), indent=2)
+            )
             logger.info(f"Audit trail written to: {audit_file}")
 
 
 def run_interactive():
-    """Interactive mode for testing prompts"""
     setup_logging(logging.INFO)
-    
     print("\n" + "=" * 70)
     print("INFRA-SKILL Interactive Mode")
     print("=" * 70)
     print("Enter your infrastructure requirements, or 'quit' to exit.\n")
-    
     orchestrator = create_orchestrator()
     orchestrator.print_skill_registry()
-    
     while True:
         print("\n" + "-" * 50)
         prompt = input("Prompt> ").strip()
-        
         if prompt.lower() in ["quit", "exit", "q"]:
             print("Goodbye!")
             break
-        
         if not prompt:
             continue
-        
         result = orchestrator.run(prompt)
         orchestrator.print_result(result)
 
 
 if __name__ == "__main__":
-    import sys
-    
     if len(sys.argv) > 1 and sys.argv[1] == "--interactive":
         run_interactive()
     else:
