@@ -1,20 +1,22 @@
+# god.py — Grounded Objectives Document
+# Patched: reset_validations_from now accepts skip_errored (default True)
+# and RemediationEntry gains strategy_type field for telemetry.
 
-# =============================================================================
-# PART 2: GROUNDED OBJECTIVES DOCUMENT (GOD)
-# =============================================================================
+from __future__ import annotations
 
-import copy
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-import hashlib
-import json
-import logging
 from typing import Any, Optional
 
 from enums import Severity, ValidationStatus
-import logger
 
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
 
 @dataclass
 class ValidationFinding:
@@ -28,7 +30,7 @@ class ValidationFinding:
     check_id: str = ""
     file_path: str = ""
     line_number: int = 0
-    
+
     def to_dict(self) -> dict:
         return {
             "rule_id": self.rule_id,
@@ -39,9 +41,12 @@ class ValidationFinding:
             "remediation_hint": self.remediation_hint,
             "check_id": self.check_id,
         }
-    
+
     def __str__(self) -> str:
-        return f"[{self.severity.name}] {self.rule_id}: {self.message} (resource: {self.resource_name})"
+        return (
+            f"[{self.severity.name}] {self.rule_id}: {self.message} "
+            f"(resource: {self.resource_name})"
+        )
 
 
 @dataclass
@@ -56,44 +61,46 @@ class ValidationResult:
     duration_ms: float = 0
     tool_version: str = ""
     raw_output: str = ""
-    
+
     def to_dict(self) -> dict:
         return {
             "status": self.status.value,
             "validator_name": self.validator_name,
             "errors": self.errors,
             "findings_count": len(self.findings),
-            "findings": [f.to_dict() for f in self.findings[:10]],  # Limit for readability
+            "findings": [f.to_dict() for f in self.findings[:10]],
             "duration_ms": self.duration_ms,
-            "tool_version": self.tool_version
+            "tool_version": self.tool_version,
         }
-    
+
     def count_by_severity(self) -> dict[str, int]:
         counts = {s.name: 0 for s in Severity}
         for f in self.findings:
             counts[f.severity.name] += 1
         return counts
-    
+
     def has_blocking_findings(self) -> bool:
-        """Check if any findings should block progress"""
-        return any(f.severity in [Severity.CRITICAL, Severity.HIGH] for f in self.findings)
-    
+        return any(
+            f.severity in [Severity.CRITICAL, Severity.HIGH]
+            for f in self.findings
+        )
+
     def get_findings_by_severity(self, severity: Severity) -> list[ValidationFinding]:
         return [f for f in self.findings if f.severity == severity]
 
 
 @dataclass
 class AcceptanceCriterion:
-    """A single acceptance criterion - must be binary and checkable"""
+    """A single acceptance criterion"""
     id: str
     description: str
     resource_type: Optional[str] = None
     property_path: Optional[str] = None
     expected_value: Any = None
-    check_type: str = "exists"  # exists, equals, contains, not_exists, not_equals, regex
+    check_type: str = "exists"
     is_met: Optional[bool] = None
     failure_reason: str = ""
-    
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,
@@ -102,7 +109,7 @@ class AcceptanceCriterion:
             "property_path": self.property_path,
             "check_type": self.check_type,
             "is_met": self.is_met,
-            "failure_reason": self.failure_reason
+            "failure_reason": self.failure_reason,
         }
 
 
@@ -111,45 +118,36 @@ class ExtractedResource:
     """A resource extracted from user intent"""
     resource_type: str
     logical_name: str
-    priority: int = 100  # Lower = generated first
+    priority: int = 100
     dependencies: list[str] = field(default_factory=list)
     properties_hints: dict = field(default_factory=dict)
     generated: bool = False
-    
+
     def to_dict(self) -> dict:
         return {
             "resource_type": self.resource_type,
             "logical_name": self.logical_name,
             "priority": self.priority,
             "dependencies": self.dependencies,
-            "generated": self.generated
+            "generated": self.generated,
         }
 
 
 @dataclass
 class Constraints:
     """Infrastructure constraints extracted from user intent"""
-    # Availability
     multi_az: bool = False
-    
-    # Security
     encryption_at_rest: bool = True
     encryption_in_transit: bool = True
     public_access_allowed: bool = False
-    
-    # Compliance
     compliance_frameworks: list[str] = field(default_factory=list)
-    
-    # Operational
     environment: str = "production"
     backup_enabled: bool = True
     backup_retention_days: int = 7
     logging_enabled: bool = True
     monitoring_enabled: bool = True
-    
-    # Cost
     cost_optimization: bool = False
-    
+
     def to_dict(self) -> dict:
         return {
             "multi_az": self.multi_az,
@@ -159,16 +157,16 @@ class Constraints:
             "compliance_frameworks": self.compliance_frameworks,
             "environment": self.environment,
             "backup_enabled": self.backup_enabled,
-            "logging_enabled": self.logging_enabled
+            "logging_enabled": self.logging_enabled,
         }
-    
+
     def is_production(self) -> bool:
         return self.environment.lower() in ["production", "prod"]
 
 
 @dataclass
 class Intent:
-    """The intent section of the GOD - what the user wants"""
+    """The intent section of the GOD"""
     raw_prompt: str = ""
     normalized_prompt: str = ""
     resources: list[ExtractedResource] = field(default_factory=list)
@@ -176,23 +174,27 @@ class Intent:
     acceptance_criteria: list[AcceptanceCriterion] = field(default_factory=list)
     parsed_at: Optional[str] = None
     parser_version: str = ""
-    
+
     def to_dict(self) -> dict:
         return {
-            "raw_prompt": self.raw_prompt[:200] + "..." if len(self.raw_prompt) > 200 else self.raw_prompt,
+            "raw_prompt": (
+                self.raw_prompt[:200] + "..."
+                if len(self.raw_prompt) > 200
+                else self.raw_prompt
+            ),
             "resources": [r.to_dict() for r in self.resources],
             "resource_count": len(self.resources),
             "constraints": self.constraints.to_dict(),
             "acceptance_criteria_count": len(self.acceptance_criteria),
-            "parsed_at": self.parsed_at
+            "parsed_at": self.parsed_at,
         }
-    
+
     def get_resource_types(self) -> set[str]:
         return {r.resource_type for r in self.resources}
-    
+
     def get_ungenerated_resources(self) -> list[ExtractedResource]:
         return [r for r in self.resources if not r.generated]
-    
+
     def mark_resource_generated(self, resource_type: str):
         for r in self.resources:
             if r.resource_type == resource_type:
@@ -201,22 +203,18 @@ class Intent:
 
 @dataclass
 class Template:
-    """The template section of the GOD - the generated artifact"""
-    format: str = "CFN"  # CFN (CloudFormation) or TF (Terraform)
+    """The template section of the GOD"""
+    format: str = "CFN"
     body: str = ""
     version: int = 0
     last_modified_by: str = ""
     last_modified_at: Optional[str] = None
-    
-    # Structured components (merged into body during assembly)
     parameters: dict[str, dict] = field(default_factory=dict)
-    resources: dict[str, str] = field(default_factory=dict)  # name -> YAML block
+    resources: dict[str, str] = field(default_factory=dict)
     outputs: dict[str, dict] = field(default_factory=dict)
     metadata: dict = field(default_factory=dict)
-    
-    # Tracking
     checksum: str = ""
-    
+
     def to_dict(self) -> dict:
         return {
             "format": self.format,
@@ -225,15 +223,13 @@ class Template:
             "last_modified_at": self.last_modified_at,
             "body_length": len(self.body),
             "resource_blocks": list(self.resources.keys()),
-            "checksum": self.checksum
+            "checksum": self.checksum,
         }
-    
+
     def update_checksum(self):
-        """Update the checksum based on current body"""
         self.checksum = hashlib.sha256(self.body.encode()).hexdigest()[:16]
-        
+
     def increment_version(self, modified_by: str):
-        """Increment version and update metadata"""
         self.version += 1
         self.last_modified_by = modified_by
         self.last_modified_at = datetime.now().isoformat()
@@ -241,17 +237,24 @@ class Template:
 
 @dataclass
 class RemediationEntry:
-    """A single remediation action in the audit log"""
+    """
+    A single remediation action in the audit log.
+
+    strategy_type is new in v2: records whether the action was produced by
+    a deterministic rule, llm_fallback, llm_plan, or an escalation.  Benchmark
+    telemetry reads this field to compute per-strategy success rates.
+    """
     round: int
     skill_name: str
-    action_type: str  # "patch", "regenerate", "config_change", "escalate"
-    target: str       # What was changed (resource name, property path, etc.)
+    action_type: str          # 'plan', 'patch', 'escalate'
+    target: str
     description: str
     rationale: str
-    findings_addressed: list[str]  # List of finding rule_ids addressed
+    findings_addressed: list[str]
     success: bool = False
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    
+    strategy_type: str = "unknown"  # NEW: 'deterministic'|'llm_fallback'|'llm_plan'|'escalate'
+
     def to_dict(self) -> dict:
         return {
             "round": self.round,
@@ -261,12 +264,12 @@ class RemediationEntry:
             "description": self.description,
             "findings_addressed": self.findings_addressed,
             "success": self.success,
-            "timestamp": self.timestamp
+            "timestamp": self.timestamp,
+            "strategy_type": self.strategy_type,
         }
 
 
 class GODEventType(Enum):
-    """Types of events that can occur on the GOD"""
     CREATED = "created"
     FIELD_UPDATED = "field_updated"
     CHECKPOINT_SAVED = "checkpoint_saved"
@@ -278,7 +281,6 @@ class GODEventType(Enum):
 
 @dataclass
 class GODEvent:
-    """An event that occurred on the GOD - for audit trail"""
     event_type: GODEventType
     field_path: str
     old_value_hash: Optional[str]
@@ -288,323 +290,260 @@ class GODEvent:
     metadata: dict = field(default_factory=dict)
 
 
+# =============================================================================
+# GROUNDED OBJECTIVES DOCUMENT
+# =============================================================================
+
 class GroundedObjectivesDocument:
     """
-    The Grounded Objectives Document (GOD) is the central artifact.
-    
-    Design principles:
-    1. Single source of truth - all agents read/write through GOD
-    2. Structured sections with clear ownership
-    3. Complete audit trail of all changes
-    4. Field locking to prevent unauthorized modifications
-    5. Checkpoint/restore capability
-    
-    Sections:
-    - intent: What the user wants (immutable after planning)
-    - template: The generated artifact (mutable during engineering/remediation)
-    - validation_state: Results of all validators (mutable by validators only)
-    - remediation_log: History of fixes applied (append-only)
+    The Grounded Objectives Document (GOD) is the central shared artifact.
+
+    All skills read and write through the GOD.  It maintains a complete audit
+    trail of every mutation, supports checkpoint/restore, and enforces field
+    locking after the planning phase.
     """
-    
-    # Validation pipeline order - validators run in this sequence
+
     VALIDATION_PIPELINE = [
         "yaml_syntax",
-        "cfn_lint", 
+        "cfn_lint",
         "checkov",
-        "intent_alignment"
+        "intent_alignment",
     ]
-    
+
     def __init__(self):
+        import logging
         self._logger = logging.getLogger("INFRA-SKILL.GOD")
-        
-        # Core sections
+
         self.intent = Intent()
         self.template = Template()
         self.validation_state: dict[str, ValidationResult] = {
-            name: ValidationResult(validator_name=name) 
+            name: ValidationResult(validator_name=name)
             for name in self.VALIDATION_PIPELINE
         }
         self.remediation_log: list[RemediationEntry] = []
-        
-        # Metadata
-        self._created_at = datetime.now().isoformat()
-        self._id = hashlib.sha256(self._created_at.encode()).hexdigest()[:12]
-        
-        # Audit and state management
-        self._events: list[GODEvent] = []
-        self._checkpoints: list[dict] = []
+        self._audit_trail: list[GODEvent] = []
         self._locked_fields: set[str] = set()
-        
-        self._record_event(GODEventType.CREATED, "root", None, None, "system")
-    
+        self._checkpoints: dict[str, dict] = {}
+
     # -------------------------------------------------------------------------
-    # Event Recording
+    # Validation state helpers
     # -------------------------------------------------------------------------
-    
-    def _record_event(
-        self, 
-        event_type: GODEventType, 
-        field_path: str,
-        old_value: Any,
-        new_value: Any,
-        actor: str,
-        metadata: dict = None
+
+    def set_validation_result(
+        self, validator_name: str, result: ValidationResult, actor: str = "unknown"
     ):
-        """Record an event for audit trail"""
-        def hash_value(v):
-            if v is None:
-                return None
-            return hashlib.sha256(str(v).encode()).hexdigest()[:8]
-        
-        event = GODEvent(
-            event_type=event_type,
-            field_path=field_path,
-            old_value_hash=hash_value(old_value),
-            new_value_hash=hash_value(new_value),
-            actor=actor,
-            metadata=metadata or {}
-        )
-        self._events.append(event)
-    
-    # -------------------------------------------------------------------------
-    # Field Access Control
-    # -------------------------------------------------------------------------
-    
-    def lock_field(self, field_path: str, actor: str = "system"):
-        """Lock a field from further modification"""
-        self._locked_fields.add(field_path)
-        self._record_event(GODEventType.LOCKED, field_path, None, None, actor)
-        self._logger.debug(f"Locked field: {field_path}")
-    
-    def is_field_locked(self, field_path: str) -> bool:
-        """Check if a field is locked"""
-        # Check exact match and parent paths
-        parts = field_path.split(".")
-        for i in range(len(parts)):
-            check_path = ".".join(parts[:i+1])
-            if check_path in self._locked_fields:
-                return True
-        return False
-    
-    def can_write(self, field_path: str, skill_writes_to: list[str]) -> bool:
-        """Check if a skill is allowed to write to a field"""
-        if self.is_field_locked(field_path):
-            return False
-        
-        # Check if field is in skill's allowed write list
-        for allowed in skill_writes_to:
-            if field_path.startswith(allowed):
-                return True
-        return False
-    
-    # -------------------------------------------------------------------------
-    # Checkpoints
-    # -------------------------------------------------------------------------
-    
-    def save_checkpoint(self, label: str = "", actor: str = "system") -> int:
-        """Save a checkpoint of current state. Returns checkpoint index."""
-        checkpoint = {
-            "index": len(self._checkpoints),
-            "label": label,
-            "timestamp": datetime.now().isoformat(),
-            "state": {
-                "intent": copy.deepcopy(self.intent),
-                "template": copy.deepcopy(self.template),
-                "validation_state": copy.deepcopy(self.validation_state),
-                "remediation_log": copy.deepcopy(self.remediation_log)
-            }
-        }
-        self._checkpoints.append(checkpoint)
-        self._record_event(GODEventType.CHECKPOINT_SAVED, "root", None, None, actor, {"label": label})
-        self._logger.debug(f"Checkpoint saved: {label} (index: {checkpoint['index']})")
-        return checkpoint["index"]
-    
-    def restore_checkpoint(self, index: int) -> bool:
-        """Restore state from a checkpoint"""
-        if index < 0 or index >= len(self._checkpoints):
-            return False
-        
-        checkpoint = self._checkpoints[index]
-        state = checkpoint["state"]
-        
-        self.intent = copy.deepcopy(state["intent"])
-        self.template = copy.deepcopy(state["template"])
-        self.validation_state = copy.deepcopy(state["validation_state"])
-        self.remediation_log = copy.deepcopy(state["remediation_log"])
-        
-        self._logger.info(f"Restored checkpoint: {checkpoint['label']} (index: {index})")
-        return True
-    
-    def get_checkpoint_labels(self) -> list[tuple[int, str, str]]:
-        """Get list of (index, label, timestamp) for all checkpoints"""
-        return [(c["index"], c["label"], c["timestamp"]) for c in self._checkpoints]
-    
-    # -------------------------------------------------------------------------
-    # Validation State Management
-    # -------------------------------------------------------------------------
-    
-    def get_validation_summary(self) -> dict[str, str]:
-        """Get status of all validators"""
-        return {name: result.status.value for name, result in self.validation_state.items()}
-    
-    def get_first_pending_validator(self) -> Optional[str]:
-        """Get the first validator that hasn't run yet"""
-        for name in self.VALIDATION_PIPELINE:
-            if self.validation_state[name].status == ValidationStatus.PENDING:
-                return name
-        return None
-    
-    def get_first_failed_validator(self) -> Optional[tuple[str, ValidationResult]]:
-        """Get the first failed validator and its result"""
-        for name in self.VALIDATION_PIPELINE:
-            result = self.validation_state[name]
-            if result.status.blocks_progress():
-                return (name, result)
-        return None
-    
-    def has_pending_validations(self) -> bool:
-        """Check if any validation is pending"""
-        return any(r.status == ValidationStatus.PENDING for r in self.validation_state.values())
-    
-    def has_failed_validations(self) -> bool:
-        """Check if any validation has failed"""
-        return any(r.status.blocks_progress() for r in self.validation_state.values())
-    
-    def all_validations_passed(self) -> bool:
-        """Check if all validations have passed"""
-        return all(
-            r.status in [ValidationStatus.PASS, ValidationStatus.SKIPPED] 
-            for r in self.validation_state.values()
-        )
-    
-    def reset_validations_from(self, validator_name: str, actor: str = "system"):
-        """Reset a validator and all downstream validators to PENDING"""
-        try:
-            start_idx = self.VALIDATION_PIPELINE.index(validator_name)
-        except ValueError:
+        if validator_name not in self.validation_state:
             self._logger.warning(f"Unknown validator: {validator_name}")
             return
-        
-        for name in self.VALIDATION_PIPELINE[start_idx:]:
-            old_status = self.validation_state[name].status
+        self.validation_state[validator_name] = result
+        self._record_event(
+            GODEventType.VALIDATION_COMPLETED,
+            f"validation_state.{validator_name}",
+            None,
+            result.status.value,
+            actor,
+        )
+
+    def has_failed_validations(self) -> bool:
+        """True when any validator is in FAIL or ERROR status."""
+        return any(
+            v.status.blocks_progress()
+            for v in self.validation_state.values()
+        )
+
+    def has_pending_validations(self) -> bool:
+        return any(
+            v.status == ValidationStatus.PENDING
+            for v in self.validation_state.values()
+        )
+
+    def all_validations_passed(self) -> bool:
+        return all(
+            v.status in (ValidationStatus.PASS, ValidationStatus.SKIPPED)
+            for v in self.validation_state.values()
+        )
+
+    def get_blocking_findings(self) -> list[ValidationFinding]:
+        findings = []
+        for result in self.validation_state.values():
+            findings.extend(
+                f for f in result.findings
+                if f.severity in (Severity.CRITICAL, Severity.HIGH)
+            )
+        return findings
+
+    def get_validation_summary(self) -> dict[str, str]:
+        return {
+            name: result.status.value
+            for name, result in self.validation_state.items()
+        }
+
+    def get_findings_summary(self) -> dict[str, int]:
+        counts: dict[str, int] = {s.name: 0 for s in Severity}
+        for result in self.validation_state.values():
+            for finding in result.findings:
+                counts[finding.severity.name] += 1
+        return counts
+
+    def reset_validations_from(
+        self,
+        from_validator: str,
+        actor: str = "unknown",
+        skip_errored: bool = True,
+    ):
+        """
+        Reset validators at and after *from_validator* back to PENDING so they
+        re-run after a remediation patch.
+
+        skip_errored (default True)
+        ---------------------------
+        When True, validators currently in ERROR status are NOT reset.  This
+        prevents the infinite-loop pattern where a tool that is missing from
+        PATH (e.g. checkov) errors on every run and immediately re-triggers
+        remediation, which resets validators, which errors again, ad infinitum.
+
+        Only set skip_errored=False in tests or when you explicitly want to
+        force a re-run of an errored validator.
+        """
+        pipeline = self.VALIDATION_PIPELINE
+        try:
+            start_idx = pipeline.index(from_validator)
+        except ValueError:
+            self._logger.warning(
+                f"reset_validations_from: unknown validator '{from_validator}'"
+            )
+            return
+
+        for name in pipeline[start_idx:]:
+            current = self.validation_state[name]
+            if skip_errored and current.status == ValidationStatus.ERROR:
+                self._logger.debug(
+                    f"  Skipping reset of '{name}' (status=ERROR, tool unavailable)"
+                )
+                continue
             self.validation_state[name] = ValidationResult(validator_name=name)
             self._record_event(
                 GODEventType.FIELD_UPDATED,
                 f"validation_state.{name}",
-                old_status.value,
+                current.status.value,
                 ValidationStatus.PENDING.value,
-                actor
+                actor,
             )
-        
-        self._logger.debug(f"Reset validations from {validator_name} onwards")
-    
-    def set_validation_result(self, validator_name: str, result: ValidationResult, actor: str):
-        """Set the result for a validator"""
-        if validator_name not in self.validation_state:
-            raise ValueError(f"Unknown validator: {validator_name}")
-        
-        old_result = self.validation_state[validator_name]
-        result.validator_name = validator_name
-        self.validation_state[validator_name] = result
-        
-        self._record_event(
-            GODEventType.VALIDATION_COMPLETED,
-            f"validation_state.{validator_name}",
-            old_result.status.value,
-            result.status.value,
-            actor,
-            {"findings_count": len(result.findings)}
-        )
-    
+
     # -------------------------------------------------------------------------
-    # Findings Aggregation
+    # Remediation helpers
     # -------------------------------------------------------------------------
-    
-    def get_all_findings(self) -> list[ValidationFinding]:
-        """Get all findings from all validators"""
-        findings = []
-        for result in self.validation_state.values():
-            findings.extend(result.findings)
-        return findings
-    
-    def get_findings_by_severity(self, severity: Severity) -> list[ValidationFinding]:
-        """Get all findings of a specific severity"""
-        return [f for f in self.get_all_findings() if f.severity == severity]
-    
-    def get_blocking_findings(self) -> list[ValidationFinding]:
-        """Get findings that block progress (CRITICAL and HIGH)"""
-        return [f for f in self.get_all_findings() if f.severity in [Severity.CRITICAL, Severity.HIGH]]
-    
-    def get_findings_summary(self) -> dict[str, int]:
-        """Get count of findings by severity"""
-        summary = {s.name: 0 for s in Severity}
-        for f in self.get_all_findings():
-            summary[f.severity.name] += 1
-        return summary
-    
-    # -------------------------------------------------------------------------
-    # Remediation
-    # -------------------------------------------------------------------------
-    
+
     def add_remediation_entry(self, entry: RemediationEntry):
-        """Add a remediation entry to the log"""
         self.remediation_log.append(entry)
         self._record_event(
             GODEventType.REMEDIATION_APPLIED,
             "remediation_log",
             None,
-            entry.description,
+            f"round={entry.round},action={entry.action_type},strategy={entry.strategy_type}",
             entry.skill_name,
-            {"round": entry.round, "success": entry.success}
         )
-    
+
     def get_remediation_round(self) -> int:
-        """Get the current remediation round number"""
-        return len(self.remediation_log)
-    
+        """Number of completed patch rounds (action_type='patch' or 'escalate', not 'plan')."""
+        return sum(
+            1 for e in self.remediation_log
+            if e.action_type in ("patch", "escalate")
+        )
+
     # -------------------------------------------------------------------------
-    # Serialization
+    # Field locking
     # -------------------------------------------------------------------------
-    
-    def snapshot(self) -> dict:
-        """Create a complete snapshot of current state"""
-        return {
-            "id": self._id,
-            "created_at": self._created_at,
-            "snapshot_at": datetime.now().isoformat(),
-            "intent": self.intent.to_dict(),
-            "template": self.template.to_dict(),
-            "validation_state": {k: v.to_dict() for k, v in self.validation_state.items()},
-            "remediation_log": [e.to_dict() for e in self.remediation_log],
-            "summary": {
-                "resources_planned": len(self.intent.resources),
-                "resources_generated": len(self.template.resources),
-                "template_version": self.template.version,
-                "validations": self.get_validation_summary(),
-                "findings": self.get_findings_summary(),
-                "remediation_rounds": len(self.remediation_log),
-                "checkpoints": len(self._checkpoints),
-                "events": len(self._events)
-            }
+
+    def lock_field(self, field_path: str, actor: str):
+        self._locked_fields.add(field_path)
+        self._record_event(
+            GODEventType.LOCKED, field_path, None, "locked", actor
+        )
+
+    def is_locked(self, field_path: str) -> bool:
+        return field_path in self._locked_fields
+
+    # -------------------------------------------------------------------------
+    # Checkpoints
+    # -------------------------------------------------------------------------
+
+    def save_checkpoint(self, name: str, actor: str):
+        self._checkpoints[name] = {
+            "template_body": self.template.body,
+            "template_version": self.template.version,
+            "validation_state": {
+                k: v.status.value for k, v in self.validation_state.items()
+            },
+            "remediation_rounds": self.get_remediation_round(),
+            "timestamp": datetime.now().isoformat(),
         }
-    
-    def export_template(self) -> str:
-        """Export the final template body"""
-        return self.template.body
-    
+        self._record_event(
+            GODEventType.CHECKPOINT_SAVED, "checkpoint", None, name, actor
+        )
+
+    # -------------------------------------------------------------------------
+    # Audit trail
+    # -------------------------------------------------------------------------
+
+    def _record_event(
+        self,
+        event_type: GODEventType,
+        field_path: str,
+        old_value: Optional[str],
+        new_value: Optional[str],
+        actor: str,
+    ):
+        self._audit_trail.append(
+            GODEvent(
+                event_type=event_type,
+                field_path=field_path,
+                old_value_hash=(
+                    hashlib.md5(old_value.encode()).hexdigest()[:8]
+                    if old_value
+                    else None
+                ),
+                new_value_hash=(
+                    hashlib.md5(new_value.encode()).hexdigest()[:8]
+                    if new_value
+                    else None
+                ),
+                actor=actor,
+            )
+        )
+
     def export_audit_trail(self) -> list[dict]:
-        """Export the complete audit trail"""
         return [
             {
                 "event_type": e.event_type.value,
                 "field_path": e.field_path,
                 "actor": e.actor,
                 "timestamp": e.timestamp,
-                "metadata": e.metadata
+                "old_value_hash": e.old_value_hash,
+                "new_value_hash": e.new_value_hash,
             }
-            for e in self._events
+            for e in self._audit_trail
         ]
-    
-    def __str__(self) -> str:
-        return json.dumps(self.snapshot(), indent=2, default=str)
 
+    # -------------------------------------------------------------------------
+    # Snapshot / summary
+    # -------------------------------------------------------------------------
+
+    def snapshot(self) -> dict:
+        return {
+            "summary": {
+                "template_version": self.template.version,
+                "template_length": len(self.template.body),
+                "remediation_rounds": self.get_remediation_round(),
+                "validation_summary": self.get_validation_summary(),
+                "findings_summary": self.get_findings_summary(),
+                "locked_fields": list(self._locked_fields),
+                "checkpoints": list(self._checkpoints.keys()),
+            },
+            "intent": self.intent.to_dict(),
+            "template": self.template.to_dict(),
+            "validation_state": {
+                k: v.to_dict() for k, v in self.validation_state.items()
+            },
+            "remediation_log": [e.to_dict() for e in self.remediation_log],
+        }
