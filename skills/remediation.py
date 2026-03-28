@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------------------
-# REMEDIATION SKILL  v2.1.0
+# REMEDIATION SKILL  v2.2.0
 # -----------------------------------------------------------------------------
 #
 # Execution order inside execute():
@@ -86,6 +86,19 @@ Rules:
 - Do NOT add or remove resources.
 - Do NOT add security changes — only fix YAML structure.
 - The output must start with 'AWSTemplateFormatVersion:'.
+- CRITICAL: Do NOT use YAML tag shorthand (!Ref, !Sub, !GetAtt, !Select,
+  !Join, !If, !Equals, !Split, !FindInMap, !Base64, !Condition).
+  These tags are rejected by the YAML parser used by this system.
+  Use the equivalent Fn:: dict form instead:
+    !Ref LogicalName          -> {Ref: LogicalName}
+    !Sub 'string ${Var}'      -> {Fn::Sub: 'string ${Var}'}
+    !GetAtt Res.Attr          -> {Fn::GetAtt: [Res, Attr]}
+    !Select [0, list]         -> {Fn::Select: [0, list]}
+    !Join [",", list]         -> {Fn::Join: [",", list]}
+    !If [cond, a, b]          -> {Fn::If: [cond, a, b]}
+    !Split [",", str]         -> {Fn::Split: [",", str]}
+    !FindInMap [M, K1, K2]    -> {Fn::FindInMap: [M, K1, K2]}
+    !Base64 value             -> {Fn::Base64: value}
 """
 
 
@@ -132,7 +145,7 @@ class RemediationSkill(Skill):
             writes_to=["template.body", "template.resources", "remediation_log"],
             reads_from=["template.body", "validation_state"],
             priority=10,
-            version="2.1.0",
+            version="2.2.0",
             tags=["remediation", "deterministic", "llm-fallback", "god-planning"],
         )
 
@@ -273,7 +286,12 @@ class RemediationSkill(Skill):
                         "You are a CloudFormation security expert. "
                         "Fix ONLY the listed findings. "
                         "Return ONLY the complete fixed YAML template. "
-                        "Do not add comments or explanations."
+                        "Do not add comments or explanations.\n"
+                        "CRITICAL: Do NOT use YAML tag shorthand (!Ref, !Sub, !GetAtt, etc.). "
+                        "Use Fn:: dict form instead: "
+                        "!Ref X -> {Ref: X}, "
+                        "!Sub S -> {Fn::Sub: S}, "
+                        "!GetAtt R.A -> {Fn::GetAtt: [R, A]}"
                     ),
                     user=(
                         f"Template:\n{god.template.body}\n\n"
@@ -379,17 +397,20 @@ class RemediationSkill(Skill):
         Strategy
         --------
         1. Ask LLM to fix the raw YAML structure (NOT security patching).
+           The prompt explicitly forbids YAML tag shorthand (!Ref, !Sub, etc.)
+           because yaml.safe_load rejects custom tags.
         2. Validate the repaired output with yaml.safe_load before committing.
         3. On success: reset validators from yaml_syntax so the fixed template
-           flows through the full chain.
+           flows through the full validation chain.
         4. On failure (no LLM / LLM produced invalid YAML):
-           - Reset yaml_syntax back to PENDING AND clear template body so the
-             general-engineer skill can re-trigger and regenerate it.
+           - Clear template.body and template.resources.
+           - Reset resource.generated = False on ALL intent resources so that
+             general-engineer.can_trigger() re-fires and regenerates the template.
+           - Reset all validators to PENDING for a clean slate.
         """
         self._logger.info("  [yaml-repair] YAML syntax error detected — using YAML repair path")
         error_msg = yaml_findings[0].message if yaml_findings else "unknown YAML error"
 
-        # --- Write plan entry so telemetry records this was a YAML repair ---
         god.add_remediation_entry(RemediationEntry(
             round=round_num,
             skill_name=self.metadata.name,
@@ -477,20 +498,28 @@ class RemediationSkill(Skill):
         error_msg: str,
     ) -> SkillResult:
         """
-        YAML repair failed.  Clear the broken template body and reset
-        validation state so the general-engineer skill can re-trigger.
+        YAML repair failed.  Clear the broken template and mark all intent
+        resources as un-generated so general-engineer re-triggers.
+
+        Without resetting resource.generated, get_ungenerated_resources()
+        returns [] -> general-engineer.can_trigger() returns False
+        -> orchestrator sees no triggerable skills -> FAILED state.
         """
         self._logger.info(
             "  [yaml-repair] Clearing broken template — general-engineer will re-run"
         )
-        # Clear the broken body so _determine_target_state routes to ENGINEERING
+
+        # 1. Wipe broken template
         god.template.body = ""
         god.template.resources = {}
         god.template.increment_version(self.metadata.name)
 
-        # Reset ALL validations (including yaml_syntax → PENDING)
-        # skip_errored=False here: we want a clean slate since the template
-        # itself is being wiped
+        # 2. KEY FIX: reset .generated on all intent resources so
+        #    get_ungenerated_resources() returns them and general-engineer fires
+        for resource in god.intent.resources:
+            resource.generated = False
+
+        # 3. Reset ALL validations to PENDING (clean slate — template is wiped)
         god.reset_validations_from("yaml_syntax", self.metadata.name, skip_errored=False)
 
         god.add_remediation_entry(RemediationEntry(
