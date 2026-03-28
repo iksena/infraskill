@@ -1,48 +1,59 @@
 # -----------------------------------------------------------------------------
-# REMEDIATION SKILL
+# REMEDIATION SKILL  v2.1.0
+# -----------------------------------------------------------------------------
+#
+# Execution order inside execute():
+#
+#   0. YAML syntax triage  — if YAML001 finding present, call LLM YAML-repair
+#      path and return early (skip security planner entirely)
+#   1. GOD-planning pass   — LLM writes RemediationPlan into GOD before any
+#      template mutation (security/structural findings only reach here)
+#   2. Deterministic Tier  — fast, zero-LLM-cost patches for known rule IDs
+#   3. LLM fallback Tier   — unknown rule IDs or plan strategy=llm_fallback
+#   4. Commit to GOD       — update template body, reset validators
+#   5. Escalate remainder  — findings that could not be patched
 # -----------------------------------------------------------------------------
 
 from dataclasses import dataclass, field
 from typing import Callable, Optional
-from enums import SkillPhase
-from god import GroundedObjectivesDocument, RemediationEntry, ValidationFinding
+from enums import SkillPhase, ValidationStatus
+from god import GroundedObjectivesDocument, RemediationEntry, ValidationFinding, ValidationResult
 from llm_client import OpenRouterClient
 from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
 
 
-_TEMPLATE_LEVEL_RESOURCE_NAMES = {"(template)", "", "TEMPLATE"}
+_TEMPLATE_LEVEL_RESOURCE_NAMES = {"(template)", "", "TEMPLATE", "template"}
 
-# -----------------------------------------------------------------------------
-# Remediation plan produced by the LLM planning step
-# -----------------------------------------------------------------------------
+
+# =============================================================================
+# Remediation plan
+# =============================================================================
 
 @dataclass
 class RemediationPlan:
     """
     Structured remediation plan produced by the LLM *before* any patching.
 
-    The LLM analyses all blocking findings against the current GOD state
-    and returns a prioritised list of actions.  The plan is written back into
-    the GOD (remediation_log) so downstream benchmark telemetry can inspect
-    *what* was decided and *why*, independently of whether the patch succeeded.
-
-    Fields
-    ------
-    strategy          : 'deterministic', 'llm_fallback', or 'escalate'
-    actions           : ordered list of (rule_id, resource_name, description)
-    rationale         : free-text explanation from the LLM
-    confidence        : 0.0 – 1.0 self-reported confidence
+    strategy   : 'deterministic' | 'llm_fallback' | 'escalate'
+    actions    : ordered list of patch descriptors
+    rationale  : LLM explanation
+    confidence : 0.0-1.0
     """
-    strategy: str  # 'deterministic' | 'llm_fallback' | 'escalate'
+    strategy: str
     actions: list[dict] = field(default_factory=list)
     rationale: str = ""
     confidence: float = 1.0
 
 
 _REMEDIATION_PLANNER_SYSTEM = """\
-You are a CloudFormation remediation planner.
+You are a CloudFormation *security* remediation planner.
 Given a list of validation findings and the current template, produce a JSON
 remediation plan.  Respond ONLY with a single valid JSON object.
+
+IMPORTANT: This planner handles SECURITY and SCHEMA findings ONLY.
+- If ANY finding has rule_id == "YAML001" the template is syntactically broken
+  and cannot be security-patched.  In that case you MUST return
+  strategy=escalate with rationale explaining that YAML repair is needed first.
 
 Output schema:
 {
@@ -58,9 +69,23 @@ Output schema:
 Rules:
 - Use 'deterministic' when ALL findings have well-known deterministic fixes.
 - Use 'llm_fallback' when at least one finding requires template-level reasoning.
-- Use 'escalate' when findings cannot be auto-remediated (e.g. missing IAM policies
-  that require human approval, or tool errors unrelated to template content).
+- Use 'escalate' when findings cannot be auto-remediated (e.g. missing IAM
+  policies that require human approval, or YAML001 syntax errors).
 - confidence is 0.0-1.0 (your self-assessed probability the plan will succeed).
+"""
+
+
+_YAML_REPAIR_SYSTEM = """\
+You are an AWS CloudFormation expert.
+The template below has a YAML syntax error.
+Fix the YAML structure so it becomes valid CloudFormation.
+
+Rules:
+- Return ONLY the complete fixed YAML.  No markdown fences, no prose.
+- Preserve ALL resources and their intended properties.
+- Do NOT add or remove resources.
+- Do NOT add security changes — only fix YAML structure.
+- The output must start with 'AWSTemplateFormatVersion:'.
 """
 
 
@@ -68,24 +93,9 @@ class RemediationSkill(Skill):
     """
     The Remediation Skill analyses validation failures and applies targeted fixes.
 
-    Three-step execution
-    --------------------
-    1. **GOD-planning pass** — LLM reads all blocking findings + current template
-       and writes a structured RemediationPlan into the GOD before any mutation.
-       This makes the remediation strategy observable in telemetry/benchmarks.
-
-    2. **Deterministic patches** — fast, precise, zero-LLM-cost for known rule IDs.
-
-    3. **LLM fallback** — for unknown rule IDs or when the plan says 'llm_fallback'.
-
-    Loop-guard invariants
-    ---------------------
-    - Only triggers when *fixable* failures exist (FAIL status, not ERROR).
-    - Calls god.reset_validations_from(..., skip_errored=True) so validators
-      that errored due to missing tools (checkov not on PATH, etc.) are NOT
-      reset and do not re-trigger the remediation loop.
-    - Each round appends a RemediationEntry with strategy_type so benchmark
-      telemetry can distinguish deterministic vs LLM-driven rounds.
+    YAML syntax errors are handled by a dedicated LLM-repair path (Step 0)
+    BEFORE the security planner runs, so a broken template never reaches a
+    planner that only knows about security/schema issues.
     """
 
     REMEDIATION_STRATEGIES: dict[str, Callable] = {}
@@ -96,47 +106,37 @@ class RemediationSkill(Skill):
 
     def _register_strategies(self):
         self.REMEDIATION_STRATEGIES = {
-            # S3
             "CKV_AWS_18": self._fix_s3_encryption,
             "CKV_AWS_19": self._fix_s3_public_access,
             "CKV_AWS_21": self._fix_s3_versioning,
-            # RDS
             "CKV_AWS_16": self._fix_rds_encryption,
             "CKV_AWS_17": self._fix_rds_public_access,
             "CKV_AWS_157": self._fix_rds_multi_az,
-            # VPC
             "CKV_AWS_10": self._fix_vpc_dns_support,
             "CKV_AWS_11": self._fix_vpc_dns_hostnames,
-            # Security Groups
             "CKV_AWS_23": self._fix_sg_description,
             "CKV_AWS_24": self._fix_sg_ssh_ingress,
             "CKV_AWS_25": self._fix_sg_rdp_ingress,
-            # Subnet
             "CKV_AWS_130": self._fix_subnet_public_ip,
-            # Lambda
             "CKV_AWS_45": self._fix_lambda_memory,
             "CKV_AWS_56": self._fix_lambda_timeout,
-            # DynamoDB
             "CKV_AWS_28": self._fix_dynamodb_pitr,
-            # CloudFormation intent findings (AC-* ids from intent validator)
-            # These cannot be patched deterministically — routed to LLM fallback
         }
 
     def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
             name="remediation",
-            description="Analyses validation failures and applies targeted fixes (plan → patch)",
+            description="Analyses validation failures and applies targeted fixes",
             phase=SkillPhase.REMEDIATION,
             trigger_condition="Any FAIL validation exists and remediation rounds not exhausted",
             writes_to=["template.body", "template.resources", "remediation_log"],
             reads_from=["template.body", "validation_state"],
             priority=10,
-            version="2.0.0",
+            version="2.1.0",
             tags=["remediation", "deterministic", "llm-fallback", "god-planning"],
         )
 
     def load_level2(self) -> bool:
-        """Lazy-import yaml once at activation."""
         if not self._level2_loaded:
             import yaml as _yaml
             self._yaml = _yaml
@@ -145,13 +145,8 @@ class RemediationSkill(Skill):
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
         """
-        Only trigger when there are genuine FAIL validations (not just ERROR).
-
-        ERROR status means a tool is missing or crashed — re-running the
-        template through the same broken tool will loop forever.  Those cases
-        must be escalated, not retried.
+        Only trigger on genuine FAIL validations (not ERROR = missing tool).
         """
-        from enums import ValidationStatus
         has_fixable_failures = any(
             v.status == ValidationStatus.FAIL
             for v in god.validation_state.values()
@@ -160,9 +155,9 @@ class RemediationSkill(Skill):
         has_template = bool(god.template.body)
         return has_fixable_failures and rounds_remaining and has_template
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # Main execution
-    # -------------------------------------------------------------------------
+    # =========================================================================
 
     def execute(self, context: SkillContext) -> SkillResult:
         god = context.god
@@ -175,13 +170,24 @@ class RemediationSkill(Skill):
             skill_result.warnings.append("No blocking findings to remediate")
             return skill_result
 
-        # ------------------------------------------------------------------
-        # STEP 1: GOD-planning pass (LLM analyses findings → writes plan)
-        # ------------------------------------------------------------------
         llm: Optional[OpenRouterClient] = context.get_config("llm")
+
+        # ------------------------------------------------------------------
+        # STEP 0: YAML syntax triage — handle BEFORE security planner
+        # ------------------------------------------------------------------
+        yaml_findings = [
+            f for f in blocking_findings if f.rule_id == "YAML001"
+        ]
+        if yaml_findings:
+            return self._handle_yaml_syntax_error(
+                god, skill_result, llm, round_num, yaml_findings
+            )
+
+        # ------------------------------------------------------------------
+        # STEP 1: GOD-planning pass
+        # ------------------------------------------------------------------
         plan = self._build_remediation_plan(god, blocking_findings, llm, round_num)
 
-        # If plan says escalate, bail out immediately without touching the template
         if plan.strategy == "escalate":
             skill_result.requires_human_review = True
             skill_result.escalation_reason = (
@@ -216,7 +222,6 @@ class RemediationSkill(Skill):
         findings_addressed: list[str] = []
         unknown_findings: list[ValidationFinding] = []
 
-        # Group findings by resource
         findings_by_resource: dict[str, list[ValidationFinding]] = {}
         for finding in blocking_findings:
             findings_by_resource.setdefault(finding.resource_name, []).append(finding)
@@ -229,30 +234,31 @@ class RemediationSkill(Skill):
                 is_template_level = res_name in _TEMPLATE_LEVEL_RESOURCE_NAMES
                 if res_name not in resources and not is_template_level:
                     continue
-
                 resource = resources.get(res_name, {})
                 properties = resource.get("Properties", {})
-
                 for finding in findings:
-                    rule_id = finding.rule_id
-                    if rule_id in self.REMEDIATION_STRATEGIES:
+                    if finding.rule_id in self.REMEDIATION_STRATEGIES:
                         try:
-                            fix_description = self.REMEDIATION_STRATEGIES[rule_id](
+                            fix_desc = self.REMEDIATION_STRATEGIES[finding.rule_id](
                                 properties, finding
                             )
-                            if fix_description:
-                                fixes_applied.append(f"{res_name}: {fix_description}")
-                                findings_addressed.append(rule_id)
-                                self._logger.info(f"  [deterministic] Fixed {rule_id} on {res_name}")
+                            if fix_desc:
+                                fixes_applied.append(f"{res_name}: {fix_desc}")
+                                findings_addressed.append(finding.rule_id)
+                                self._logger.info(
+                                    f"  [deterministic] Fixed {finding.rule_id} on {res_name}"
+                                )
                         except Exception as e:
-                            self._logger.warning(f"  Failed to fix {rule_id}: {e}")
+                            self._logger.warning(f"  Failed to fix {finding.rule_id}: {e}")
                             unknown_findings.append(finding)
                     else:
-                        self._logger.warning(f"  No deterministic strategy for {rule_id}")
+                        self._logger.warning(
+                            f"  No deterministic strategy for {finding.rule_id}"
+                        )
                         unknown_findings.append(finding)
 
         # ------------------------------------------------------------------
-        # STEP 3b: LLM fallback for unknown rule IDs (Tier 2)
+        # STEP 3b: LLM fallback (Tier 2)
         # ------------------------------------------------------------------
         if (plan.strategy == "llm_fallback" or unknown_findings) and llm is not None:
             llm_targets = unknown_findings if unknown_findings else blocking_findings
@@ -269,11 +275,13 @@ class RemediationSkill(Skill):
                         "Return ONLY the complete fixed YAML template. "
                         "Do not add comments or explanations."
                     ),
-                    user=f"Template:\n{god.template.body}\n\nFindings to fix:\n{findings_text}",
+                    user=(
+                        f"Template:\n{god.template.body}\n\n"
+                        f"Findings to fix:\n{findings_text}"
+                    ),
                     temperature=0.0,
                 )
-                # Validate LLM output before committing
-                self._yaml.safe_load(fixed_yaml)
+                self._yaml.safe_load(fixed_yaml)  # validate before committing
                 template = self._yaml.safe_load(fixed_yaml)
                 resources = template.get("Resources", {})
                 for f in llm_targets:
@@ -299,18 +307,17 @@ class RemediationSkill(Skill):
                 )
                 god.template.update_checksum()
                 god.template.increment_version(self.metadata.name)
-
-                # KEY FIX: skip_errored=True ensures validators that errored
-                # due to missing tools (checkov not on PATH, etc.) are NOT
-                # reset and do not re-enter the loop.
-                god.reset_validations_from("yaml_syntax", self.metadata.name, skip_errored=True)
+                # skip_errored=True: don't reset validators that errored
+                # due to missing tools (prevents infinite loop)
+                god.reset_validations_from(
+                    "yaml_syntax", self.metadata.name, skip_errored=True
+                )
 
                 strategy_type = (
                     "deterministic" if not unknown_findings
                     else "llm_fallback" if llm is not None
                     else "deterministic_partial"
                 )
-
                 god.add_remediation_entry(RemediationEntry(
                     round=round_num,
                     skill_name=self.metadata.name,
@@ -323,7 +330,6 @@ class RemediationSkill(Skill):
                     strategy_type=strategy_type,
                 ))
                 skill_result.changes_made = fixes_applied
-
             except Exception as e:
                 skill_result.success = False
                 skill_result.errors.append(f"Failed to serialize fixed template: {e}")
@@ -355,9 +361,158 @@ class RemediationSkill(Skill):
 
         return skill_result
 
-    # -------------------------------------------------------------------------
-    # GOD-planning: LLM decides strategy before patching
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # STEP 0: YAML syntax repair
+    # =========================================================================
+
+    def _handle_yaml_syntax_error(
+        self,
+        god: GroundedObjectivesDocument,
+        skill_result: SkillResult,
+        llm: Optional[OpenRouterClient],
+        round_num: int,
+        yaml_findings: list[ValidationFinding],
+    ) -> SkillResult:
+        """
+        Dedicated handler for YAML001 findings.
+
+        Strategy
+        --------
+        1. Ask LLM to fix the raw YAML structure (NOT security patching).
+        2. Validate the repaired output with yaml.safe_load before committing.
+        3. On success: reset validators from yaml_syntax so the fixed template
+           flows through the full chain.
+        4. On failure (no LLM / LLM produced invalid YAML):
+           - Reset yaml_syntax back to PENDING AND clear template body so the
+             general-engineer skill can re-trigger and regenerate it.
+        """
+        self._logger.info("  [yaml-repair] YAML syntax error detected — using YAML repair path")
+        error_msg = yaml_findings[0].message if yaml_findings else "unknown YAML error"
+
+        # --- Write plan entry so telemetry records this was a YAML repair ---
+        god.add_remediation_entry(RemediationEntry(
+            round=round_num,
+            skill_name=self.metadata.name,
+            action_type="plan",
+            target="(planning)",
+            description="GOD-planning: strategy=yaml_repair (YAML syntax error detected)",
+            rationale=f"YAML001: {error_msg[:200]}",
+            findings_addressed=["YAML001"],
+            success=True,
+            strategy_type="yaml_repair",
+        ))
+
+        if llm is None:
+            self._logger.warning(
+                "  [yaml-repair] No LLM available — resetting template for re-generation"
+            )
+            return self._reset_for_reengineering(god, skill_result, round_num, error_msg)
+
+        try:
+            repaired = llm.complete(
+                system=_YAML_REPAIR_SYSTEM,
+                user=(
+                    f"YAML error: {error_msg}\n\n"
+                    f"Broken template:\n{god.template.body}"
+                ),
+                temperature=0.0,
+            )
+
+            # Strip markdown fences the LLM might add
+            import re as _re
+            repaired = _re.sub(
+                r'^```[\w]*\n?|\n?```$', '', repaired.strip(),
+                flags=_re.MULTILINE
+            ).strip()
+
+            # Validate before committing
+            self._yaml.safe_load(repaired)
+
+            # Sanity: must still look like a CFN template
+            if "AWSTemplateFormatVersion" not in repaired and "Resources" not in repaired:
+                raise ValueError(
+                    "Repaired template missing AWSTemplateFormatVersion/Resources"
+                )
+
+            god.template.body = repaired
+            god.template.update_checksum()
+            god.template.increment_version(self.metadata.name)
+            god.reset_validations_from(
+                "yaml_syntax", self.metadata.name, skip_errored=True
+            )
+
+            god.add_remediation_entry(RemediationEntry(
+                round=round_num,
+                skill_name=self.metadata.name,
+                action_type="patch",
+                target="template",
+                description="LLM repaired YAML syntax error",
+                rationale=f"Fixed: {error_msg[:200]}",
+                findings_addressed=["YAML001"],
+                success=True,
+                strategy_type="yaml_repair",
+            ))
+            skill_result.changes_made = ["YAML syntax repaired by LLM"]
+            self._logger.info("  [yaml-repair] YAML repaired and committed to GOD")
+            return skill_result
+
+        except self._yaml.YAMLError as e:
+            self._logger.warning(
+                f"  [yaml-repair] LLM produced invalid YAML ({e}); "
+                "falling back to re-engineering"
+            )
+        except Exception as e:
+            self._logger.warning(
+                f"  [yaml-repair] LLM repair failed ({e}); "
+                "falling back to re-engineering"
+            )
+
+        return self._reset_for_reengineering(god, skill_result, round_num, error_msg)
+
+    def _reset_for_reengineering(
+        self,
+        god: GroundedObjectivesDocument,
+        skill_result: SkillResult,
+        round_num: int,
+        error_msg: str,
+    ) -> SkillResult:
+        """
+        YAML repair failed.  Clear the broken template body and reset
+        validation state so the general-engineer skill can re-trigger.
+        """
+        self._logger.info(
+            "  [yaml-repair] Clearing broken template — general-engineer will re-run"
+        )
+        # Clear the broken body so _determine_target_state routes to ENGINEERING
+        god.template.body = ""
+        god.template.resources = {}
+        god.template.increment_version(self.metadata.name)
+
+        # Reset ALL validations (including yaml_syntax → PENDING)
+        # skip_errored=False here: we want a clean slate since the template
+        # itself is being wiped
+        god.reset_validations_from("yaml_syntax", self.metadata.name, skip_errored=False)
+
+        god.add_remediation_entry(RemediationEntry(
+            round=round_num,
+            skill_name=self.metadata.name,
+            action_type="patch",
+            target="template",
+            description="Cleared broken template; re-engineering will regenerate",
+            rationale=f"YAML repair failed for: {error_msg[:200]}",
+            findings_addressed=["YAML001"],
+            success=False,
+            strategy_type="yaml_repair",
+        ))
+        skill_result.changes_made = ["Broken template cleared — re-engineering triggered"]
+        skill_result.warnings.append(
+            "YAML repair failed; template cleared for re-generation by general-engineer"
+        )
+        return skill_result
+
+    # =========================================================================
+    # GOD-planning: LLM decides strategy before security patching
+    # =========================================================================
 
     def _build_remediation_plan(
         self,
@@ -366,15 +521,6 @@ class RemediationSkill(Skill):
         llm: Optional[OpenRouterClient],
         round_num: int,
     ) -> RemediationPlan:
-        """
-        Ask the LLM to produce a structured remediation plan and write it back
-        into the GOD before any template mutation occurs.
-
-        Falls back to a deterministic plan when:
-        - No LLM client is configured, OR
-        - All findings have registered deterministic strategies, OR
-        - The LLM call fails.
-        """
         import json
 
         # Fast path: all findings have deterministic strategies
@@ -397,14 +543,15 @@ class RemediationSkill(Skill):
                 f"  [plan] strategy=deterministic "
                 f"({len(findings)} findings, round {round_num})"
             )
-            # Write plan as a PLANNING-type remediation entry so telemetry picks it up
             god.add_remediation_entry(RemediationEntry(
                 round=round_num,
                 skill_name=self.metadata.name,
                 action_type="plan",
                 target="(planning)",
-                description=f"GOD-planning: strategy=deterministic, "
-                            f"actions={len(plan.actions)}, confidence={plan.confidence}",
+                description=(
+                    f"GOD-planning: strategy=deterministic, "
+                    f"actions={len(plan.actions)}, confidence={plan.confidence}"
+                ),
                 rationale=plan.rationale,
                 findings_addressed=[f.rule_id for f in findings],
                 success=True,
@@ -415,8 +562,7 @@ class RemediationSkill(Skill):
         # LLM planning pass
         if llm is not None:
             findings_text = "\n".join(
-                f"- [{f.severity.name}] {f.rule_id} on {f.resource_name}: "
-                f"{f.message}"
+                f"- [{f.severity.name}] {f.rule_id} on {f.resource_name}: {f.message}"
                 for f in findings
             )
             known_ids = list(self.REMEDIATION_STRATEGIES.keys())
@@ -442,7 +588,6 @@ class RemediationSkill(Skill):
                     f"  [plan] LLM strategy={plan.strategy} "
                     f"confidence={plan.confidence:.2f} round={round_num}"
                 )
-                # Write plan into GOD so telemetry can inspect it
                 god.add_remediation_entry(RemediationEntry(
                     round=round_num,
                     skill_name=self.metadata.name,
@@ -467,7 +612,7 @@ class RemediationSkill(Skill):
         # Default fallback plan
         plan = RemediationPlan(
             strategy="llm_fallback",
-            rationale="LLM planning unavailable; applying LLM fallback for unknown findings.",
+            rationale="LLM planning unavailable; using LLM fallback for unknown findings.",
             confidence=0.5,
         )
         god.add_remediation_entry(RemediationEntry(
@@ -483,9 +628,9 @@ class RemediationSkill(Skill):
         ))
         return plan
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # Deterministic fix strategies
-    # -------------------------------------------------------------------------
+    # =========================================================================
 
     def _fix_s3_encryption(self, props: dict, finding: ValidationFinding) -> str:
         props["BucketEncryption"] = {
@@ -497,10 +642,8 @@ class RemediationSkill(Skill):
 
     def _fix_s3_public_access(self, props: dict, finding: ValidationFinding) -> str:
         props["PublicAccessBlockConfiguration"] = {
-            "BlockPublicAcls": True,
-            "BlockPublicPolicy": True,
-            "IgnorePublicAcls": True,
-            "RestrictPublicBuckets": True,
+            "BlockPublicAcls": True, "BlockPublicPolicy": True,
+            "IgnorePublicAcls": True, "RestrictPublicBuckets": True,
         }
         return "Added public access block configuration"
 
@@ -536,20 +679,18 @@ class RemediationSkill(Skill):
     def _fix_sg_ssh_ingress(self, props: dict, finding: ValidationFinding) -> str:
         ingress = props.get("SecurityGroupIngress", [])
         props["SecurityGroupIngress"] = [
-            rule for rule in ingress
-            if not (rule.get("CidrIp") == "0.0.0.0/0"
-                    and rule.get("FromPort", 0) == 22)
+            r for r in ingress
+            if not (r.get("CidrIp") == "0.0.0.0/0" and r.get("FromPort", 0) == 22)
         ]
-        return "Removed unrestricted SSH (0.0.0.0/0:22) ingress rule"
+        return "Removed unrestricted SSH ingress"
 
     def _fix_sg_rdp_ingress(self, props: dict, finding: ValidationFinding) -> str:
         ingress = props.get("SecurityGroupIngress", [])
         props["SecurityGroupIngress"] = [
-            rule for rule in ingress
-            if not (rule.get("CidrIp") == "0.0.0.0/0"
-                    and rule.get("FromPort", 0) == 3389)
+            r for r in ingress
+            if not (r.get("CidrIp") == "0.0.0.0/0" and r.get("FromPort", 0) == 3389)
         ]
-        return "Removed unrestricted RDP (0.0.0.0/0:3389) ingress rule"
+        return "Removed unrestricted RDP ingress"
 
     def _fix_subnet_public_ip(self, props: dict, finding: ValidationFinding) -> str:
         props["MapPublicIpOnLaunch"] = False
@@ -566,5 +707,7 @@ class RemediationSkill(Skill):
         return "Set timeout to 30s"
 
     def _fix_dynamodb_pitr(self, props: dict, finding: ValidationFinding) -> str:
-        props["PointInTimeRecoverySpecification"] = {"PointInTimeRecoveryEnabled": True}
+        props["PointInTimeRecoverySpecification"] = {
+            "PointInTimeRecoveryEnabled": True
+        }
         return "Enabled Point-in-Time Recovery"
