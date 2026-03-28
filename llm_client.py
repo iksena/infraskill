@@ -19,7 +19,7 @@ class OpenRouterClient:
         site_name: str = "INFRA-SKILL",
     ):
         self.model = model
-        self.api_key = api_key or "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" #or os.environ["OPENROUTER_API_KEY"]
+        self.api_key = api_key or os.environ["OPENROUTER_API_KEY"]
         self.site_url = site_url
         self.site_name = site_name
 
