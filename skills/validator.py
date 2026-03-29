@@ -34,6 +34,58 @@ from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
 
 _PASS_OR_ERROR = (ValidationStatus.PASS, ValidationStatus.ERROR)
 
+# -----------------------------------------------------------------------------
+# CloudFormation-aware YAML loader
+# -----------------------------------------------------------------------------
+# PyYAML's safe_load rejects all custom tags (e.g. !Ref, !Sub, !GetAtt).
+# CloudFormation templates use these tags extensively, so we register
+# passthrough constructors for every known CFN intrinsic function tag.
+# This approach is taken directly from the IaCGen evaluation pipeline
+# (Code/evaluation/cloud_evaluation.py :: get_required_resource_types).
+# -----------------------------------------------------------------------------
+
+_CFN_TAGS = [
+    "!Ref", "!Sub", "!GetAtt", "!Join", "!Select", "!Split",
+    "!Equals", "!If", "!FindInMap", "!GetAZs", "!Base64", "!Cidr",
+    "!Transform", "!ImportValue", "!Not", "!And", "!Or", "!Condition",
+    "!ForEach", "!ValueOf", "!Rain::Embed",
+]
+
+
+def _build_cfn_loader():
+    """Return a yaml.SafeLoader subclass that accepts all CFN intrinsic tags."""
+    import yaml
+
+    class CloudFormationLoader(yaml.SafeLoader):
+        pass
+
+    def _construct_cfn_tag(loader, node):
+        if isinstance(node, yaml.ScalarNode):
+            return node.value
+        elif isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node)
+        elif isinstance(node, yaml.MappingNode):
+            return loader.construct_mapping(node)
+
+    for tag in _CFN_TAGS:
+        CloudFormationLoader.add_constructor(tag, _construct_cfn_tag)
+
+    return CloudFormationLoader
+
+
+def cfn_safe_load(template_body: str):
+    """
+    Parse a CloudFormation YAML template string.
+
+    Uses a custom SafeLoader subclass that registers passthrough constructors
+    for all common CFN intrinsic function tags (!Ref, !Sub, !GetAtt, etc.)
+    so they are preserved as plain strings/lists/dicts rather than causing a
+    ConstructorError. Falls back to standard yaml.safe_load for JSON templates.
+    """
+    import yaml
+    loader_cls = _build_cfn_loader()
+    return yaml.load(template_body, Loader=loader_cls)  # noqa: S506 — custom safe loader
+
 
 # =============================================================================
 # 1. YAML SYNTAX VALIDATOR
@@ -41,20 +93,47 @@ _PASS_OR_ERROR = (ValidationStatus.PASS, ValidationStatus.ERROR)
 
 class YAMLSyntaxValidatorSkill(Skill):
     """
-    Validates YAML syntax of the generated template.
+    Validates YAML syntax of the generated CloudFormation template.
+
+    Uses yamllint for structural YAML correctness (indentation, trailing
+    spaces, etc.) and then parses with a CFN-aware loader that accepts all
+    intrinsic function tags (!Ref, !Sub, !GetAtt, …).
 
     Static / pure-Python — no LLM, no CLI tool.
-    Progressive disclosure: yaml module imported lazily in load_level2().
+    Progressive disclosure: yaml/yamllint modules imported lazily in
+    load_level2().
+    """
+
+    # yamllint config mirrors the IaCGen evaluation pipeline settings so that
+    # YAML correctness is judged by the same rules as the research baseline.
+    _YAMLLINT_CONFIG = """
+        extends: default
+        rules:
+            document-start: disable
+            line-length: disable
+            trailing-spaces: disable
+            new-line-at-end-of-file: disable
+            indentation:
+                spaces: consistent
+                indent-sequences: consistent
+            truthy:
+                allowed-values: ['true', 'false', 'yes', 'no']
     """
 
     def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
             name="yaml-validator",
-            version="1.0.0",
-            description="Validates that the template body is syntactically valid YAML.",
+            version="2.0.0",
+            description=(
+                "Validates that the template body is syntactically valid YAML "
+                "and parseable as a CloudFormation template (supports !Ref, "
+                "!Sub, !GetAtt and all other CFN intrinsic tags)."
+            ),
             llm_description=(
-                "Parses the template body with PyYAML. Fails if the YAML is "
-                "malformed, empty, or the root node is not a mapping."
+                "Runs yamllint for structural YAML correctness, then parses "
+                "with a CFN-aware SafeLoader that accepts intrinsic function "
+                "tags. Fails if the YAML is malformed, empty, or the root "
+                "node is not a mapping."
             ),
             phase=SkillPhase.VALIDATION,
             trigger_condition="template.body exists AND validation_state.yaml_syntax is PENDING",
@@ -68,6 +147,18 @@ class YAMLSyntaxValidatorSkill(Skill):
         if not self._level2_loaded:
             import yaml as _yaml
             self._yaml = _yaml
+            try:
+                from yamllint import linter as _linter
+                from yamllint.config import YamlLintConfig as _YamlLintConfig
+                self._linter = _linter
+                self._YamlLintConfig = _YamlLintConfig
+                self._yamllint_available = True
+            except ImportError:
+                self._logger.warning(
+                    "yamllint not installed; falling back to PyYAML CFN parse only. "
+                    "Install with: pip install yamllint"
+                )
+                self._yamllint_available = False
             self._level2_loaded = True
         return True
 
@@ -84,15 +175,40 @@ class YAMLSyntaxValidatorSkill(Skill):
         result = ValidationResult(validator_name="yaml_syntax")
         result.started_at = datetime.now().isoformat()
 
+        # ------------------------------------------------------------------
+        # Step 1: yamllint structural check (mirrors IaCGen evaluation)
+        # ------------------------------------------------------------------
+        if self._yamllint_available:
+            lint_errors = self._run_yamllint(template_body)
+            if lint_errors:
+                error_msg = "\n".join(lint_errors)
+                result.status = ValidationStatus.FAIL
+                result.errors.append(error_msg)
+                result.findings.append(ValidationFinding(
+                    rule_id="YAML001",
+                    resource_name="template",
+                    resource_type="template",
+                    severity=Severity.CRITICAL,
+                    message=error_msg,
+                ))
+                god.set_validation_result("yaml_syntax", result, actor="yaml-validator")
+                return SkillResult.failure(self.metadata.name, f"YAML lint errors:\n{error_msg}")
+
+        # ------------------------------------------------------------------
+        # Step 2: CFN-aware parse — accepts !Ref, !Sub, !GetAtt, etc.
+        # ------------------------------------------------------------------
         try:
-            import yaml
-            yaml.safe_load(template_body)
+            parsed = cfn_safe_load(template_body)
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    f"Template root must be a YAML mapping, got {type(parsed).__name__}"
+                )
             result.status = ValidationStatus.PASS
             god.set_validation_result("yaml_syntax", result, actor="yaml-validator")
             return SkillResult.success_with_changes(
                 self.metadata.name, ["yaml_syntax: PASS"]
             )
-        except yaml.YAMLError as e:
+        except Exception as e:
             result.status = ValidationStatus.FAIL
             result.errors.append(str(e))
             result.findings.append(ValidationFinding(
@@ -104,6 +220,20 @@ class YAMLSyntaxValidatorSkill(Skill):
             ))
             god.set_validation_result("yaml_syntax", result, actor="yaml-validator")
             return SkillResult.failure(self.metadata.name, f"YAML parse error: {e}")
+
+    def _run_yamllint(self, template_body: str) -> list[str]:
+        """Return a list of error-level yamllint messages (warnings ignored)."""
+        try:
+            config = self._YamlLintConfig(self._YAMLLINT_CONFIG)
+            problems = list(self._linter.run(template_body, config))
+            return [
+                f"Line {p.line}: {p.desc}"
+                for p in problems
+                if p.level == "error"
+            ]
+        except Exception as exc:
+            self._logger.warning(f"yamllint check failed unexpectedly: {exc}")
+            return []
 
 
 # =============================================================================
@@ -743,9 +873,8 @@ class IntentAlignmentValidatorSkill(Skill):
         vr: ValidationResult,
         skill_result: SkillResult,
     ) -> SkillResult:
-        import yaml as _yaml
         try:
-            template = _yaml.safe_load(god.template.body)
+            template = cfn_safe_load(god.template.body)
         except Exception as exc:
             vr.status = ValidationStatus.ERROR
             vr.errors = [f"Cannot parse template for structural check: {exc}"]
