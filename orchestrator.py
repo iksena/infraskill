@@ -12,7 +12,7 @@ The Orchestrator is NOT an LLM agent - it is a pure state machine that:
 5. Produces complete audit trails
 
 Author: INFRA-SKILL
-Version: 1.4.0  (telemetry integration)
+Version: 1.4.1  (restore create_default_skills)
 """
 
 from __future__ import annotations
@@ -39,6 +39,40 @@ from skills.planner import PlannerSkill
 from skills.remediation import RemediationSkill
 from skills.validator import CFNLintValidatorSkill, CheckovValidatorSkill, IntentAlignmentValidatorSkill, YAMLSyntaxValidatorSkill
 from telemetry import TelemetryRecorder
+
+
+# =============================================================================
+# MODULE-LEVEL FACTORY
+# =============================================================================
+
+def create_default_skills() -> list[Skill]:
+    """
+    Return the canonical ordered list of skills for the INFRA-SKILL pipeline.
+
+    Call order within each phase is controlled by SkillMetadata.priority (lower
+    number = higher priority).  The registry resolves ordering; this list just
+    needs to contain every skill the pipeline requires.
+
+    Phases & skills
+    ---------------
+    PLANNING    : PlannerSkill
+    ENGINEERING : GeneralEngineerSkill
+    VALIDATION  : YAMLSyntaxValidatorSkill (priority 10)
+                  CFNLintValidatorSkill    (priority 20)
+                  CheckovValidatorSkill    (priority 30)
+                  IntentAlignmentValidatorSkill (priority 40)
+    REMEDIATION : RemediationSkill
+    """
+    return [
+        PlannerSkill(),
+        GeneralEngineerSkill(),
+        YAMLSyntaxValidatorSkill(),
+        CFNLintValidatorSkill(),
+        CheckovValidatorSkill(),
+        IntentAlignmentValidatorSkill(),
+        RemediationSkill(),
+    ]
+
 
 @dataclass
 class OrchestratorConfig:
@@ -156,6 +190,10 @@ class EventEmitter:
 class Orchestrator:
     """
     Deterministic state machine coordinating the INFRA-SKILL pipeline.
+
+    v1.4.1 change: restored create_default_skills() at module level so that
+    benchmark.py can do:
+        from orchestrator import Orchestrator, OrchestratorConfig, create_default_skills
 
     v1.4.0 change: TelemetryRecorder is created per-run and injected into
     every SkillContext via context.config["telemetry"].  Skills call
