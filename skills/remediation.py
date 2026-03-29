@@ -1,5 +1,8 @@
 # -----------------------------------------------------------------------------
-# REMEDIATION SKILL  v3.2.0  — pure LLM + telemetry instrumentation
+# REMEDIATION SKILL  v3.3.0  — no round cap; iteration budget controls stopping
+# -----------------------------------------------------------------------------
+# can_trigger() no longer checks get_remediation_round() < N.
+# The orchestrator's max_total_iterations is the sole stop condition.
 # -----------------------------------------------------------------------------
 
 import time
@@ -22,6 +25,11 @@ class RemediationSkill(Skill):
     Two paths, both LLM-driven:
     1. In-place fix  — security, schema, and YAML syntax findings.
     2. Re-plan       — intent/coverage/AC-* findings.
+
+    There is no round cap here.  The orchestrator's max_total_iterations is
+    the only mechanism that stops the remediation loop.  This ensures the
+    pipeline always attempts to reach SUCCEEDED (all validations PASS) while
+    iterations remain.
     """
 
     def _define_metadata(self) -> SkillMetadata:
@@ -33,22 +41,18 @@ class RemediationSkill(Skill):
             ),
             phase=SkillPhase.REMEDIATION,
             trigger_condition=(
-                "Any FAIL validator has blocking findings AND "
-                "remediation rounds < 5 AND template.body is non-empty"
+                "Any FAIL validator has blocking findings AND template.body is non-empty"
             ),
             writes_to=["template.body", "template.version", "remediation_log"],
             reads_from=["template.body", "validation_state"],
             priority=10,
-            version="3.2.0",
+            version="3.3.0",
             tags=["llm", "remediation", "cloudformation"],
         )
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
-        return (
-            god.has_remediable_failures()
-            and god.get_remediation_round() < 5
-            and bool(god.template.body)
-        )
+        # No round cap — the orchestrator iteration budget is the only stop.
+        return god.has_remediable_failures() and bool(god.template.body)
 
     # =========================================================================
     # Main execution
