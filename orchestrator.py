@@ -34,7 +34,7 @@ from llm_client import OpenRouterClient
 from logger import setup_logging
 from prompt import SKILL_SELECTOR_PROMPT
 from skill_framework import Skill, SkillContext, SkillRegistry, SkillResult
-from skills.engineer import GeneralEngineerSkill, TemplateAssemblerSkill
+from skills.engineer import GeneralEngineerSkill
 from skills.planner import PlannerSkill
 from skills.remediation import RemediationSkill
 from skills.validator import CFNLintValidatorSkill, CheckovValidatorSkill, IntentAlignmentValidatorSkill, YAMLSyntaxValidatorSkill
@@ -46,7 +46,7 @@ class OrchestratorConfig:
     # Loop guards
     max_remediation_rounds: int = 5
     max_total_iterations: int = 50
-    max_skill_retries: int = 2
+    max_skill_retries: int = 50
 
     # Validation behavior
     fail_on_critical_findings: bool = True
@@ -63,7 +63,7 @@ class OrchestratorConfig:
     log_god_snapshots: bool = False
 
     # Execution
-    skill_timeout_seconds: int = 120
+    skill_timeout_seconds: int = 3600
 
     llm_client: Optional[object] = None
 
@@ -694,7 +694,6 @@ def create_default_skills() -> list[Skill]:
     return [
         PlannerSkill(),
         GeneralEngineerSkill(),
-        TemplateAssemblerSkill(),
         YAMLSyntaxValidatorSkill(),
         CFNLintValidatorSkill(),
         CheckovValidatorSkill(),
