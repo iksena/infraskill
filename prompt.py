@@ -7,7 +7,7 @@
 
 PLANNER_SYSTEM_PROMPT = """\
 You are an AWS infrastructure architect. Analyse the user's natural language prompt and extract a \
-structured infrastructure specification. Respond ONLY with a single valid JSON object — no markdown, \
+structured infrastructure specification. Respond ONLY with a single valid JSON object -- no markdown, \
 no explanation, no code fences.
 
 ## Output schema
@@ -127,33 +127,39 @@ CloudFormation template that has failed validation.
 
 - Analyse all provided validation findings carefully.
 - Produce a COMPLETE, corrected CloudFormation template that resolves every finding.
-- Preserve ALL resources and their intended behaviour — do not remove resources.
+- Preserve ALL resources and their intended behaviour -- do not remove resources.
 - Do not introduce new issues while fixing existing ones.
 
 ## Output rules
 
 - Output ONLY the complete fixed YAML template. Start with AWSTemplateFormatVersion.
 - No markdown fences, no prose, no explanations.
+- CRITICAL: The template you are fixing may already contain YAML tag shorthand (!Ref, !Sub,
+  !GetAtt, etc.). You MUST convert EVERY occurrence to dict form in your output.
+  Search the entire template for any line containing a YAML tag (starting with !) and
+  replace it. Missing even one will cause a YAML parse failure.
 - Use Fn:: intrinsic function dict form ONLY. YAML tag shorthand crashes the parser:
     FORBIDDEN: !Ref, !Sub, !GetAtt, !Select, !Join, !If, !Equals, !Split,
                !FindInMap, !Base64, !Condition, !ImportValue, !Transform
-  Required equivalents:
-    !Ref LogicalName           -> {Ref: LogicalName}
-    !Sub 'string ${Var}'       -> {Fn::Sub: 'string ${Var}'}
-    !GetAtt Res.Attr           -> {Fn::GetAtt: [Res, Attr]}
-    !Select [0, list]          -> {Fn::Select: [0, list]}
-    !Join [",", list]          -> {Fn::Join: [",", list]}
-    !If [cond, a, b]           -> {Fn::If: [cond, a, b]}
-    !Split [",", str]          -> {Fn::Split: [",", str]}
-    !FindInMap [M, K1, K2]     -> {Fn::FindInMap: [M, K1, K2]}
-    !Base64 value              -> {Fn::Base64: value}
-    !ImportValue export        -> {Fn::ImportValue: export}
+  Required dict-form equivalents:
+    !Ref LogicalName           ->   Ref: LogicalName
+    !Sub 'string ${Var}'       ->   Fn::Sub: 'string ${Var}'
+    !GetAtt Res.Attr           ->   Fn::GetAtt: [Res, Attr]
+    !Select [0, list]          ->   Fn::Select: [0, list]
+    !Join [",", list]          ->   Fn::Join: [",", list]
+    !If [cond, a, b]           ->   Fn::If: [cond, a, b]
+    !Split [",", str]          ->   Fn::Split: [",", str]
+    !FindInMap [M, K1, K2]     ->   Fn::FindInMap: [M, K1, K2]
+    !Base64 value              ->   Fn::Base64: value
+    !ImportValue export        ->   Fn::ImportValue: export
 
 ## Common fixes by finding type
 
 - YAML001 (syntax error): Fix indentation, quoting, and structure issues.
+  If the error mentions a YAML tag (!Ref, !Sub, etc.) convert ALL such tags
+  to dict form throughout the entire template -- not just the reported line.
 - INTENT / COVERAGE / AC-* (missing resources or properties): Add the missing resources
-  or properties that satisfy the intent. Do not just patch — ensure the template fully
+  or properties that satisfy the intent. Do not just patch -- ensure the template fully
   fulfils the original infrastructure goal.
 - CKV_AWS_* (Checkov security): Apply the specific security configuration required by
   each rule (e.g. encryption, public access blocks, Multi-AZ, versioning, backups).

@@ -12,7 +12,7 @@ The Orchestrator is NOT an LLM agent - it is a pure state machine that:
 5. Produces complete audit trails
 
 Author: INFRA-SKILL
-Version: 1.2.0  (FAIL vs ERROR routing fix)
+Version: 1.3.0  (timeout-advance fix, loop-guard fix, consecutive-failure guard)
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import traceback
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from enum import Enum
@@ -41,31 +42,31 @@ from skills.validator import CFNLintValidatorSkill, CheckovValidatorSkill, Inten
 @dataclass
 class OrchestratorConfig:
     """Configuration for the Orchestrator"""
-    
+
     # Loop guards
     max_remediation_rounds: int = 5
     max_total_iterations: int = 50
     max_skill_retries: int = 2
-    
+
     # Validation behavior
     fail_on_critical_findings: bool = True
     fail_on_high_findings: bool = True
     allow_medium_findings: bool = True
-    
+
     # Checkpointing
     enable_checkpoints: bool = True
     checkpoint_on_phase_change: bool = True
     checkpoint_on_validation_failure: bool = True
-    
+
     # Logging
     verbose_logging: bool = True
     log_god_snapshots: bool = False
-    
+
     # Execution
     skill_timeout_seconds: int = 120
 
-    llm_client: Optional[object] = None  
-    
+    llm_client: Optional[object] = None
+
     def to_dict(self) -> dict:
         return {
             "max_remediation_rounds": self.max_remediation_rounds,
@@ -110,19 +111,19 @@ EventHandler = Callable[[OrchestratorEvent], None]
 
 class EventEmitter:
     """Simple event emitter for orchestrator events"""
-    
+
     def __init__(self):
         self._handlers: dict[OrchestratorEventType, list[EventHandler]] = {
             et: [] for et in OrchestratorEventType
         }
         self._global_handlers: list[EventHandler] = []
-    
+
     def on(self, event_type: OrchestratorEventType, handler: EventHandler):
         self._handlers[event_type].append(handler)
-    
+
     def on_any(self, handler: EventHandler):
         self._global_handlers.append(handler)
-    
+
     def emit(self, event_type: OrchestratorEventType, data: dict = None):
         event = OrchestratorEvent(
             event_type=event_type,
@@ -150,24 +151,38 @@ class Orchestrator:
     Deterministic state machine coordinating the INFRA-SKILL pipeline.
 
     Pipeline stages (in order):
-        PLANNING → ENGINEERING → ASSEMBLING → VALIDATING
-                                                   ↓ (FAIL findings)
+        PLANNING -> ENGINEERING -> ASSEMBLING -> VALIDATING
+                                                   | (FAIL findings)
                                               REMEDIATING
-                                                   ↓
+                                                   |
                                               VALIDATING  (repeat up to max_remediation_rounds)
-                                                   ↓ (all pass or ERROR only)
+                                                   | (all pass or ERROR only)
                                               SUCCEEDED
 
     Key routing rule
     ----------------
     _determine_target_state() routes to REMEDIATING only when
-    god.has_remediable_failures() is True — meaning at least one validator
+    god.has_remediable_failures() is True -- meaning at least one validator
     is FAIL with blocking (CRITICAL/HIGH) findings.
 
     Validators in ERROR state (tool not on PATH) are treated as SKIPPED:
     they do NOT trigger remediation and do NOT block SUCCEEDED.  This
     prevents the infinite loop where a missing tool (e.g. checkov) causes
-    perpetual VALIDATING → REMEDIATING → no-op → FAILED.
+    perpetual VALIDATING -> REMEDIATING -> no-op -> FAILED.
+
+    FIX v1.3.0 -- Timeout / consecutive-failure guard
+    --------------------------------------------------
+    When a skill returns a failed result (including timeout), the orchestrator
+    now increments a per-skill consecutive-failure counter.  Once that counter
+    reaches max_skill_retries the pipeline transitions to FAILED immediately
+    rather than letting _determine_target_state() re-evaluate and silently
+    advance to the next phase.  This prevents the pattern:
+
+        planner TIMEOUT -> intent still empty -> _determine_target_state
+        sees template also empty -> routes ENGINEERING -> engineer receives
+        no spec -> produces garbage YAML with !Ref shorthand -> chaos.
+
+    The consecutive-failure counter is reset whenever a skill succeeds.
     """
 
     _STAGE_ORDER: list[OrchestratorState] = [
@@ -191,37 +206,39 @@ class Orchestrator:
         self._state_history: list[tuple[OrchestratorState, str, str]] = []
         self._start_time: Optional[datetime] = None
         self._end_time: Optional[datetime] = None
-    
+        # BUG 1 FIX: per-skill consecutive failure counter
+        self._consecutive_failures: dict[str, int] = defaultdict(int)
+
     # -------------------------------------------------------------------------
     # Builder Pattern
     # -------------------------------------------------------------------------
-    
+
     def with_config(self, config: OrchestratorConfig) -> Orchestrator:
         self.config = config
         return self
-    
+
     def with_skill(self, skill: Skill) -> Orchestrator:
         self.registry.register(skill)
         return self
-    
+
     def with_skills(self, skills: list[Skill]) -> Orchestrator:
         self.registry.register_all(skills)
         return self
-    
+
     def on_event(self, event_type: OrchestratorEventType, handler: EventHandler) -> Orchestrator:
         self.events.on(event_type, handler)
         return self
-    
+
     # -------------------------------------------------------------------------
     # State Machine
     # -------------------------------------------------------------------------
-    
+
     def _transition_to(self, new_state: OrchestratorState, reason: str = ""):
         old_state = self.state
         self.state = new_state
         timestamp = datetime.now().isoformat()
         self._state_history.append((new_state, reason, timestamp))
-        self._logger.info(f"State: {old_state.name} → {new_state.name}" + (f" ({reason})" if reason else ""))
+        self._logger.info(f"State: {old_state.name} -> {new_state.name}" + (f" ({reason})" if reason else ""))
         self.events.emit(OrchestratorEventType.STATE_CHANGED, {
             "old_state": old_state.name,
             "new_state": new_state.name,
@@ -244,25 +261,25 @@ class Orchestrator:
         has_failed_validations() (FAIL or ERROR).  This is the critical
         distinction:
 
-          FAIL   → template has a real defect → REMEDIATING
-          ERROR  → tool missing from PATH    → treat as SKIPPED, continue
+          FAIL   -> template has a real defect -> REMEDIATING
+          ERROR  -> tool missing from PATH    -> treat as SKIPPED, continue
 
         Without this distinction, a missing checkov binary causes permanent
-        oscillation: VALIDATING → REMEDIATING → (no blocking findings) →
-        no skill triggers → FAILED.
+        oscillation: VALIDATING -> REMEDIATING -> (no blocking findings) ->
+        no skill triggers -> FAILED.
         """
         if self.god is None:
             return OrchestratorState.UNINITIALIZED
-        
+
         if self.state.is_terminal():
             return self.state
-        
+
         # Loop guards
         if self.god.get_remediation_round() >= self.config.max_remediation_rounds:
             return OrchestratorState.ESCALATED
         if self._iteration >= self.config.max_total_iterations:
             return OrchestratorState.ESCALATED
-        
+
         # Success: all validators PASS, SKIPPED, or ERROR (tool absent)
         if self.god.all_validations_passed():
             if self.god.has_error_validations():
@@ -275,11 +292,11 @@ class Orchestrator:
                     f"(tool unavailable): {error_names}"
                 )
             return OrchestratorState.SUCCEEDED
-        
-        # Real failures with blocking findings → remediate
+
+        # Real failures with blocking findings -> remediate
         if self.god.has_remediable_failures():
             return OrchestratorState.REMEDIATING
-        
+
         # Forward progress: what is still missing in GOD?
         if not self.god.intent.resources:
             return OrchestratorState.PLANNING
@@ -319,11 +336,11 @@ class Orchestrator:
 
         if target_state != self.state:
             reason_map = {
-                OrchestratorState.PLANNING:    "intent missing — re-plan",
-                OrchestratorState.ENGINEERING: "template missing — engineer",
-                OrchestratorState.ASSEMBLING:  "resources ready — assemble",
-                OrchestratorState.VALIDATING:  "template ready — validate",
-                OrchestratorState.REMEDIATING: "validation failures — remediate",
+                OrchestratorState.PLANNING:    "intent missing -- re-plan",
+                OrchestratorState.ENGINEERING: "template missing -- engineer",
+                OrchestratorState.ASSEMBLING:  "resources ready -- assemble",
+                OrchestratorState.VALIDATING:  "template ready -- validate",
+                OrchestratorState.REMEDIATING: "validation failures -- remediate",
                 OrchestratorState.SUCCEEDED:   "all validations passed",
                 OrchestratorState.ESCALATED:   "loop guard triggered",
             }
@@ -450,7 +467,7 @@ class Orchestrator:
             "errors": result.errors
         })
         return result
-    
+
     def _record_execution(self, skill: Skill, result: SkillResult):
         self._execution_log.append({
             "iteration": self._iteration,
@@ -463,11 +480,11 @@ class Orchestrator:
             "errors": result.errors,
             "warnings": result.warnings
         })
-    
+
     # -------------------------------------------------------------------------
     # Main Execution Loop
     # -------------------------------------------------------------------------
-    
+
     def run(self, user_prompt: str) -> dict:
         self._logger.info("=" * 70)
         self._logger.info("INFRA-SKILL Pipeline Starting")
@@ -477,6 +494,7 @@ class Orchestrator:
         self._iteration = 0
         self._execution_log = []
         self._state_history = []
+        self._consecutive_failures = defaultdict(int)  # reset per run
         self.god = GroundedObjectivesDocument()
         self.god.intent.raw_prompt = user_prompt
         self.god.lock_field("intent.raw_prompt", "orchestrator")
@@ -487,7 +505,7 @@ class Orchestrator:
             "registered_skills": len(self.registry)
         })
         self._transition_to(OrchestratorState.PLANNING, "initialization complete")
-        
+
         while self._iteration < self.config.max_total_iterations:
             self._iteration += 1
             if self.config.verbose_logging:
@@ -516,11 +534,12 @@ class Orchestrator:
                 else:
                     self._transition_to(
                         OrchestratorState.FAILED,
-                        f"pipeline stuck — no triggerable skills in phase {self._current_phase}"
+                        f"pipeline stuck -- no triggerable skills in phase {self._current_phase}"
                     )
                 break
             self._logger.info(f"Executing: {skill.metadata.name}")
             result = self._execute_skill(skill)
+
             if result.requires_human_review:
                 self._transition_to(
                     OrchestratorState.ESCALATED,
@@ -531,13 +550,42 @@ class Orchestrator:
                     "reason": result.escalation_reason
                 })
                 break
+
             if result.success:
+                # Reset the consecutive-failure counter for this skill on success.
+                self._consecutive_failures[skill.metadata.name] = 0
                 for change in result.changes_made:
-                    self._logger.info(f"  ✓ {change}")
+                    self._logger.info(f"  v {change}")
             else:
+                # BUG 1 + 2 FIX: Track consecutive failures per skill.
+                # If a skill fails (including timeout) too many times in a row,
+                # fail the pipeline immediately.  This prevents a timed-out
+                # planner from being "skipped" by _determine_target_state()
+                # advancing to ENGINEERING with an empty intent.
+                self._consecutive_failures[skill.metadata.name] += 1
+                consec = self._consecutive_failures[skill.metadata.name]
                 for error in result.errors:
-                    self._logger.warning(f"  ✗ {error}")
-        
+                    self._logger.warning(f"  x {error}")
+                if consec >= self.config.max_skill_retries:
+                    self._logger.error(
+                        f"Skill '{skill.metadata.name}' failed {consec} consecutive "
+                        f"time(s) (max={self.config.max_skill_retries}). "
+                        "Aborting pipeline."
+                    )
+                    self._transition_to(
+                        OrchestratorState.FAILED,
+                        f"{skill.metadata.name} exceeded max consecutive failures"
+                    )
+                    break
+                # Do NOT advance state on failure — loop back and let
+                # _determine_target_state() re-evaluate.  The same skill
+                # will trigger again on the next iteration because GOD has
+                # not changed (intent is still empty / template still empty).
+                self._logger.info(
+                    f"  Skill failed (attempt {consec}/{self.config.max_skill_retries}), "
+                    "retrying same phase next iteration."
+                )
+
         self._end_time = datetime.now()
         self.events.emit(OrchestratorEventType.PIPELINE_COMPLETED, {
             "final_state": self.state.name,
@@ -545,13 +593,13 @@ class Orchestrator:
             "duration_ms": (self._end_time - self._start_time).total_seconds() * 1000
         })
         return self._build_result()
-    
+
     def _log_iteration_status(self):
-        self._logger.info(f"\n{'─' * 50}")
+        self._logger.info(f"\n{'--' * 25}")
         self._logger.info(f"Iteration {self._iteration} | State: {self.state.name}")
         self._logger.info(f"Validations: {self.god.get_validation_summary()}")
         self._logger.info(f"Remediation Rounds: {self.god.get_remediation_round()}")
-    
+
     def _build_result(self) -> dict:
         success = self.state == OrchestratorState.SUCCEEDED
         duration_ms = 0
@@ -575,11 +623,11 @@ class Orchestrator:
             ],
             "god_snapshot": self.god.snapshot() if self.config.log_god_snapshots else None
         }
-    
+
     # -------------------------------------------------------------------------
     # Inspection helpers
     # -------------------------------------------------------------------------
-    
+
     def get_status(self) -> dict:
         return {
             "state": self.state.name,
@@ -589,7 +637,7 @@ class Orchestrator:
             "registered_skills": len(self.registry),
             "recent_executions": self._execution_log[-5:] if self._execution_log else []
         }
-    
+
     def print_skill_registry(self):
         print("\n" + "=" * 70)
         print("REGISTERED SKILLS")
@@ -603,12 +651,12 @@ class Orchestrator:
                     m = skill.metadata
                     print(f"  [{m.priority:3}] {m.name:25} - {m.description[:40]}")
         print("\n" + "=" * 70)
-    
+
     def print_result(self, result: dict):
         print("\n" + "=" * 70)
         print("PIPELINE RESULT")
         print("=" * 70)
-        status_icon = "✓" if result["success"] else "✗"
+        status_icon = "v" if result["success"] else "x"
         status_color = "\033[32m" if result["success"] else "\033[31m"
         reset = "\033[0m"
         print(f"\nStatus: {status_color}{status_icon} {result['state']}{reset}")
@@ -617,7 +665,7 @@ class Orchestrator:
         print(f"Remediation Rounds: {result['remediation_rounds']}")
         print("\nValidation Summary:")
         for validator, status in result["validation_summary"].items():
-            icon = "✓" if status == "PASS" else ("✗" if status == "FAIL" else "○")
+            icon = "v" if status == "PASS" else ("x" if status == "FAIL" else "o")
             print(f"  {icon} {validator}: {status}")
         print("\nFindings Summary:")
         for severity, count in result["findings_summary"].items():
@@ -656,113 +704,25 @@ def create_default_skills() -> list[Skill]:
 
 
 def create_orchestrator(
-    config: OrchestratorConfig = None,
-    skills: list[Skill] = None
+    llm_client=None,
+    max_remediation_rounds: int = 5,
+    max_total_iterations: int = 50,
+    max_skill_retries: int = 2,
+    skill_timeout_seconds: int = 120,
+    verbose_logging: bool = True,
 ) -> Orchestrator:
-    config = config or OrchestratorConfig()
-    skills = skills if skills is not None else create_default_skills()
-    orchestrator = Orchestrator(config)
-    orchestrator.with_skills(skills)
-    return orchestrator
-
-
-# =============================================================================
-# CLI AND MAIN EXECUTION
-# =============================================================================
-
-def demo_event_handler(event: OrchestratorEvent):
-    icon = {
-        OrchestratorEventType.PIPELINE_STARTED: "🚀",
-        OrchestratorEventType.PIPELINE_COMPLETED: "🏁",
-        OrchestratorEventType.STATE_CHANGED: "⚡",
-        OrchestratorEventType.SKILL_STARTED: "▶️",
-        OrchestratorEventType.SKILL_COMPLETED: "✅",
-        OrchestratorEventType.SKILL_FAILED: "❌",
-        OrchestratorEventType.VALIDATION_GATE_PASSED: "✓",
-        OrchestratorEventType.VALIDATION_GATE_FAILED: "✗",
-        OrchestratorEventType.LOOP_GUARD_TRIGGERED: "⚠️",
-        OrchestratorEventType.ESCALATION_REQUIRED: "🚨",
-    }.get(event.event_type, "•")
-    if event.event_type in [
-        OrchestratorEventType.PIPELINE_STARTED,
-        OrchestratorEventType.PIPELINE_COMPLETED,
-        OrchestratorEventType.SKILL_COMPLETED,
-        OrchestratorEventType.SKILL_FAILED,
-        OrchestratorEventType.ESCALATION_REQUIRED,
-    ]:
-        print(f"  {icon} {event.event_type.value}: {event.data}")
-
-
-def main():
-    setup_logging(logging.INFO)
-    logger = logging.getLogger("INFRA-SKILL.Main")
+    """
+    Factory function: create a fully-configured Orchestrator with default skills.
+    """
     config = OrchestratorConfig(
-        max_remediation_rounds=5,
-        max_total_iterations=30,
-        verbose_logging=True,
-        enable_checkpoints=True,
-        skill_timeout_seconds=120,
-        llm_client=OpenRouterClient(
-            model="arcee-ai/trinity-large-preview:free",
-            default_timeout=90,
-            max_retries=3,
-        ),
+        llm_client=llm_client,
+        max_remediation_rounds=max_remediation_rounds,
+        max_total_iterations=max_total_iterations,
+        max_skill_retries=max_skill_retries,
+        skill_timeout_seconds=skill_timeout_seconds,
+        verbose_logging=verbose_logging,
     )
-    orchestrator = create_orchestrator(config)
-    orchestrator.on_event(OrchestratorEventType.PIPELINE_COMPLETED, demo_event_handler)
-    orchestrator.on_event(OrchestratorEventType.ESCALATION_REQUIRED, demo_event_handler)
-    orchestrator.print_skill_registry()
-    prompts = [
-        """
-        Create a production VPC with multi-AZ subnets, an S3 bucket for application logs,
-        and a PostgreSQL RDS database. The environment should be highly available,
-        encrypted, and follow CIS security best practices. No public access should be allowed.
-        """,
-        "Create a simple S3 bucket for storing static assets with encryption enabled",
-        "Set up a Lambda function with an IAM role for processing data",
-        "Create a development VPC with a single subnet and basic security group",
-    ]
-    for prompt in prompts:
-        print("\n" + "=" * 80)
-        print("USER PROMPT:")
-        print("-" * 80)
-        print(prompt.strip())
-        print("=" * 80)
-        result = orchestrator.run(prompt.strip())
-        orchestrator.print_result(result)
-        if result["success"]:
-            output_file = Path("generated_template.yaml")
-            output_file.write_text(result["template"])
-            logger.info(f"Template written to: {output_file}")
-            audit_file = Path("audit_trail.json")
-            audit_file.write_text(
-                json.dumps(orchestrator.god.export_audit_trail(), indent=2)
-            )
-            logger.info(f"Audit trail written to: {audit_file}")
-
-
-def run_interactive():
-    setup_logging(logging.INFO)
-    print("\n" + "=" * 70)
-    print("INFRA-SKILL Interactive Mode")
-    print("=" * 70)
-    print("Enter your infrastructure requirements, or 'quit' to exit.\n")
-    orchestrator = create_orchestrator()
-    orchestrator.print_skill_registry()
-    while True:
-        print("\n" + "-" * 50)
-        prompt = input("Prompt> ").strip()
-        if prompt.lower() in ["quit", "exit", "q"]:
-            print("Goodbye!")
-            break
-        if not prompt:
-            continue
-        result = orchestrator.run(prompt)
-        orchestrator.print_result(result)
-
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--interactive":
-        run_interactive()
-    else:
-        main()
+    return (
+        Orchestrator(config)
+        .with_skills(create_default_skills())
+    )

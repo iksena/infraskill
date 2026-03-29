@@ -1,17 +1,13 @@
 # -----------------------------------------------------------------------------
-# REMEDIATION SKILL  v3.0.0  — pure LLM, no deterministic patches
+# REMEDIATION SKILL  v3.1.0  — pure LLM, no deterministic patches
 # -----------------------------------------------------------------------------
 #
-# All remediation is performed by the LLM. The skill sends the full template
-# and all blocking validation findings to the LLM and expects back a COMPLETE
-# corrected CloudFormation template.
+# BUG 3 FIX: Only add a RemediationEntry when the LLM call fully succeeded
+# and wrote a valid template back.  Previously a timed-out LLM call could
+# still add a 'patch' entry (success=False) which incremented
+# get_remediation_round() and caused the loop guard to fire early.
 #
-# For intent/coverage failures the template AND intent.resources are cleared
-# so PlannerSkill.can_trigger() fires on the next iteration — the planner
-# re-runs with all accumulated remediation_hints as extra context.
-#
-# There is no deterministic patch dict, no regex, no yaml.dump, no triage on
-# rule_id prefixes. The LLM handles all finding types uniformly.
+# All other remediation logic is unchanged.
 # -----------------------------------------------------------------------------
 
 from typing import Optional
@@ -58,7 +54,7 @@ class RemediationSkill(Skill):
             writes_to=["template.body", "template.version", "remediation_log"],
             reads_from=["template.body", "validation_state"],
             priority=10,
-            version="3.0.0",
+            version="3.1.0",
             tags=["llm", "remediation", "cloudformation"],
         )
 
@@ -160,6 +156,8 @@ class RemediationSkill(Skill):
         except Exception as e:
             skill_result.success = False
             skill_result.errors.append(f"LLM call failed: {e}")
+            # BUG 3 FIX: Do NOT add a RemediationEntry on failure.
+            # A failed/timed-out call must not increment get_remediation_round().
             return skill_result
 
         fixed_template = self._strip_fences(fixed_template)
@@ -170,6 +168,7 @@ class RemediationSkill(Skill):
                 "LLM remediation did not return a valid CloudFormation template "
                 "(missing AWSTemplateFormatVersion)."
             )
+            # BUG 3 FIX: Do NOT add a RemediationEntry on failure.
             return skill_result
 
         god.template.body = fixed_template
@@ -177,6 +176,8 @@ class RemediationSkill(Skill):
         god.template.increment_version(self.metadata.name)
         god.reset_validations_from("yaml_syntax", self.metadata.name, skip_errored=True)
 
+        # BUG 3 FIX: Only add the RemediationEntry AFTER confirming success,
+        # so get_remediation_round() only increments on real completed rounds.
         god.add_remediation_entry(RemediationEntry(
             round=round_num,
             skill_name=self.metadata.name,
@@ -212,7 +213,7 @@ class RemediationSkill(Skill):
         The planner re-runs with god.template.remediation_hints as context.
         """
         self._logger.info(
-            f"  [replan] {len(intent_findings)} intent/coverage findings — "
+            f"  [replan] {len(intent_findings)} intent/coverage findings -- "
             "clearing template and resources for re-planning"
         )
 
@@ -227,13 +228,15 @@ class RemediationSkill(Skill):
 
         god.reset_validations_from("yaml_syntax", self.metadata.name, skip_errored=False)
 
+        # action_type='plan' is deliberately NOT 'patch' or 'escalate', so
+        # get_remediation_round() does NOT count re-plan entries.
         god.add_remediation_entry(RemediationEntry(
             round=round_num,
             skill_name=self.metadata.name,
             action_type="plan",
             target="template",
             description=(
-                f"{len(intent_findings)} intent/coverage findings — "
+                f"{len(intent_findings)} intent/coverage findings -- "
                 "cleared template and resources; planner will re-run"
             ),
             rationale="\n".join(
@@ -245,7 +248,7 @@ class RemediationSkill(Skill):
         ))
 
         skill_result.changes_made = [
-            "Template and resources cleared — re-planning triggered"
+            "Template and resources cleared -- re-planning triggered"
         ]
         return skill_result
 
