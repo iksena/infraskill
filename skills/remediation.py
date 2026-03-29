@@ -1,20 +1,10 @@
 # -----------------------------------------------------------------------------
-# REMEDIATION SKILL  v3.4.0
+# REMEDIATION SKILL  v3.3.0  -- no round cap; iteration budget controls stopping
 # -----------------------------------------------------------------------------
-# Changes vs v3.3.0:
-#   - Added _deterministic_sanitise() pre-pass that regex-replaces known-bad
-#     YAML patterns BEFORE the LLM output is written to the GOD.
-#     Handles:
-#       1. List-item inline dict: `- Key: Val: ...` -> `- Key:\n    Val: ...`
-#       2. YAML tag shorthand:   `!Ref X`  -> `Ref: X`
-#                                `!Sub X`  -> `Fn::Sub: X`
-#                                `!GetAtt X.Y` -> `Fn::GetAtt: [X, Y]`
-#   - _llm_fix() calls _deterministic_sanitise() after _strip_fences() and
-#     logs how many substitutions were made.
-#   - No round cap (inherited from v3.3.0).
+# can_trigger() no longer checks get_remediation_round() < N.
+# The orchestrator's max_total_iterations is the sole stop condition.
 # -----------------------------------------------------------------------------
 
-import re
 import time
 from typing import Optional
 
@@ -27,89 +17,6 @@ from telemetry import TelemetryRecorder
 
 _REPLAN_PREFIXES = ("INTENT", "COVERAGE", "AC-")
 
-# ---------------------------------------------------------------------------
-# Regex patterns for the deterministic YAML sanitiser
-# ---------------------------------------------------------------------------
-
-# Pattern 1 -- list-item with an inline key:value that itself contains a colon
-# e.g.  `          - AWS::StackName: Ref: AWS::StackName`
-#  ->   `          - Ref: AWS::StackName`
-# More generally:  `- <ns>::<Name>: <fn>: <value>`  where the outer key is
-# a pseudo-namespace that should not be there at all.
-_RE_LIST_INLINE_NS = re.compile(
-    r'^([ \t]*)-[ \t]+[A-Za-z0-9_:]+:[ \t]+((?:Ref|Fn::[A-Za-z]+):[ \t]*.+)$',
-    re.MULTILINE,
-)
-
-# Pattern 2 -- YAML tag shorthand  !Ref X
-_RE_TAG_REF = re.compile(r'!Ref[ \t]+(\S+)')
-
-# Pattern 3 -- YAML tag shorthand  !Sub '...'  or  !Sub "..."
-_RE_TAG_SUB = re.compile(r"!Sub[ \t]+(['\"]?.+?['\"]?)(?=$|\n)")
-
-# Pattern 4 -- YAML tag shorthand  !GetAtt Logical.Attr
-_RE_TAG_GETATT = re.compile(r'!GetAtt[ \t]+([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)')
-
-# Pattern 5 -- YAML tag shorthand  !Join, !Select, !If, !Split, !FindInMap,
-#              !Base64, !ImportValue, !Equals, !Condition, !Transform
-#              (convert to flow-mapping dict form on the same line)
-_RE_TAG_OTHER = re.compile(
-    r'!(Join|Select|If|Split|FindInMap|Base64|ImportValue|Equals|Condition|Transform)'
-    r'([ \t]+)',
-)
-
-
-def _deterministic_sanitise(template: str) -> tuple[str, int]:
-    """
-    Apply regex-based fixes for known-bad YAML patterns that LLMs commonly
-    produce.  Returns (sanitised_template, substitution_count).
-
-    This runs AFTER _strip_fences() and BEFORE the template is written to the
-    GOD.  It is a best-effort pass: it catches the high-frequency regressions
-    without attempting to fully parse the YAML.
-    """
-    count = 0
-    out = template
-
-    # --- 1. List-item with spurious namespace key -------------------------
-    # `          - AWS::StackName: Ref: AWS::StackName`
-    # becomes
-    # `          - Ref: AWS::StackName`
-    def _fix_list_inline(m: re.Match) -> str:
-        indent = m.group(1)
-        intrinsic = m.group(2)  # e.g. "Ref: AWS::StackName"
-        return f"{indent}- {intrinsic}"
-
-    new_out, n = _RE_LIST_INLINE_NS.subn(_fix_list_inline, out)
-    count += n
-    out = new_out
-
-    # --- 2. !Ref X  ->  Ref: X ------------------------------------------
-    new_out, n = _RE_TAG_REF.subn(lambda m: f"Ref: {m.group(1)}", out)
-    count += n
-    out = new_out
-
-    # --- 3. !Sub '...'  ->  Fn::Sub: '...' -------------------------------
-    new_out, n = _RE_TAG_SUB.subn(lambda m: f"Fn::Sub: {m.group(1)}", out)
-    count += n
-    out = new_out
-
-    # --- 4. !GetAtt Logical.Attr  ->  Fn::GetAtt: [Logical, Attr] --------
-    new_out, n = _RE_TAG_GETATT.subn(
-        lambda m: f"Fn::GetAtt: [{m.group(1)}, {m.group(2)}]", out
-    )
-    count += n
-    out = new_out
-
-    # --- 5. Other YAML tags  ->  Fn:: prefix (keep remainder as-is) ------
-    new_out, n = _RE_TAG_OTHER.subn(
-        lambda m: f"Fn::{m.group(1)}{m.group(2)}", out
-    )
-    count += n
-    out = new_out
-
-    return out, count
-
 
 class RemediationSkill(Skill):
     """
@@ -119,13 +26,10 @@ class RemediationSkill(Skill):
     1. In-place fix  -- security, schema, and YAML syntax findings.
     2. Re-plan       -- intent/coverage/AC-* findings.
 
-    After receiving the LLM output, _deterministic_sanitise() is applied to
-    catch the most common YAML anti-patterns before writing to the GOD.  This
-    breaks infinite loops caused by the LLM repeatedly producing the same
-    broken pattern.
-
-    There is no round cap.  The orchestrator's max_total_iterations is the
-    only mechanism that stops the remediation loop.
+    There is no round cap here.  The orchestrator's max_total_iterations is
+    the only mechanism that stops the remediation loop.  This ensures the
+    pipeline always attempts to reach SUCCEEDED (all validations PASS) while
+    iterations remain.
     """
 
     def _define_metadata(self) -> SkillMetadata:
@@ -133,7 +37,7 @@ class RemediationSkill(Skill):
             name="remediation",
             description=(
                 "Fixes a CloudFormation template that has failed validation. "
-                "Uses the LLM + deterministic sanitiser to produce a corrected template."
+                "Uses the LLM to produce a corrected complete template."
             ),
             phase=SkillPhase.REMEDIATION,
             trigger_condition=(
@@ -142,11 +46,12 @@ class RemediationSkill(Skill):
             writes_to=["template.body", "template.version", "remediation_log"],
             reads_from=["template.body", "validation_state"],
             priority=10,
-            version="3.4.0",
+            version="3.3.0",
             tags=["llm", "remediation", "cloudformation"],
         )
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
+        # No round cap -- the orchestrator iteration budget is the only stop.
         return god.has_remediable_failures() and bool(god.template.body)
 
     # =========================================================================
@@ -185,14 +90,10 @@ class RemediationSkill(Skill):
         self._accumulate_hints(god, round_num, blocking_findings)
 
         if intent_findings and not fixable_findings:
-            return self._reset_for_replanning(
-                god, skill_result, round_num, intent_findings, tel, iteration
-            )
+            return self._reset_for_replanning(god, skill_result, round_num, intent_findings, tel, iteration)
 
         findings_to_fix = fixable_findings or blocking_findings
-        return self._llm_fix(
-            god, skill_result, llm, round_num, findings_to_fix, tel, iteration
-        )
+        return self._llm_fix(god, skill_result, llm, round_num, findings_to_fix, tel, iteration)
 
     # =========================================================================
     # LLM in-place fix
@@ -266,13 +167,7 @@ class RemediationSkill(Skill):
             skill_result.errors.append(f"LLM call failed: {llm_err}")
             return skill_result
 
-        # -- post-process: strip fences then apply deterministic sanitiser --
         fixed_template = self._strip_fences(fixed_template)
-        fixed_template, sanitise_count = _deterministic_sanitise(fixed_template)
-        if sanitise_count:
-            self._logger.info(
-                f"  [sanitise] Applied {sanitise_count} deterministic YAML fix(es)"
-            )
 
         if "AWSTemplateFormatVersion" not in fixed_template:
             skill_result.success = False
@@ -302,10 +197,7 @@ class RemediationSkill(Skill):
             skill_name=self.metadata.name,
             action_type="patch",
             target="template",
-            description=(
-                f"LLM fixed {len(findings)} findings in-place"
-                + (f"; sanitiser applied {sanitise_count} fix(es)" if sanitise_count else "")
-            ),
+            description=f"LLM fixed {len(findings)} findings in-place",
             rationale=f"Findings: {[f.rule_id for f in findings]}",
             findings_addressed=[f.rule_id for f in findings],
             success=True,
@@ -314,7 +206,6 @@ class RemediationSkill(Skill):
 
         skill_result.changes_made = [
             f"LLM remediated {len(findings)} findings (round {round_num})"
-            + (f"; {sanitise_count} deterministic sanitise fix(es)" if sanitise_count else "")
         ]
         self._logger.info(f"  [llm-fix] Template updated successfully")
         return skill_result

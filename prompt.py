@@ -153,61 +153,11 @@ CloudFormation template that has failed validation.
     !Base64 value              ->   Fn::Base64: value
     !ImportValue export        ->   Fn::ImportValue: export
 
-## DANGEROUS PATTERNS -- these look valid but are BROKEN CloudFormation YAML
-
-The following anti-patterns produce "mapping values are not allowed here" parse errors
-because YAML inline-dicts on sequence items have strict colon-spacing rules.
-NEVER write these forms. Use the corrected form on the right instead.
-
-### Pattern 1 -- inline Ref on a list item
-  BROKEN (causes parse error):
-      Tags:
-        - Key: Name
-          Value:
-            - AWS::StackName: Ref: AWS::StackName
-
-  CORRECT:
-      Tags:
-        - Key: Name
-          Value:
-            Ref: AWS::StackName
-
-### Pattern 2 -- inline Sub on a list item (same anti-pattern)
-  BROKEN:
-      Tags:
-        - Key: Name
-          Value:
-            - AWS::StackName: Fn::Sub: '${AWS::StackName}'
-
-  CORRECT:
-      Tags:
-        - Key: Name
-          Value:
-            Fn::Sub: '${AWS::StackName}'
-
-### Pattern 3 -- bare Ref as a list item instead of a scalar
-  BROKEN:
-      - Ref: SomeParam           # only one key is fine, but the value must not
-        ExtraKey: bad            # have sibling keys on the same list item
-
-  CORRECT:
-      - Ref: SomeParam
-
-### Pattern 4 -- !Sub / !Ref tags (YAML tag shorthand) anywhere in the template
-  BROKEN:  Name: !Sub '${AWS::StackName}-Name'
-  CORRECT: Name:
-             Fn::Sub: '${AWS::StackName}-Name'
-
-  OR on one line using YAML flow mapping:
-  CORRECT: Name: {Fn::Sub: '${AWS::StackName}-Name'}
-
 ## Common fixes by finding type
 
 - YAML001 (syntax error): Fix indentation, quoting, and structure issues.
   If the error mentions a YAML tag (!Ref, !Sub, etc.) convert ALL such tags
   to dict form throughout the entire template -- not just the reported line.
-  If the error mentions "mapping values are not allowed", check for the
-  dangerous patterns above and replace every occurrence.
 - INTENT / COVERAGE / AC-* (missing resources or properties): Add the missing resources
   or properties that satisfy the intent. Do not just patch -- ensure the template fully
   fulfils the original infrastructure goal.
