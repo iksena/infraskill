@@ -76,8 +76,8 @@ CloudFormation template in YAML that satisfies the infrastructure specification 
 
 - Generate ALL resources listed in the specification in the correct dependency order.
 - Apply every constraint from the specification (environment, encryption, HA, compliance, etc.).
-- Resolve ALL cross-resource references correctly using Fn:: intrinsic functions.
-- Follow AWS security best practices: least-privilege IAM, no 0.0.0.0/0 ingress unless \
+- Resolve ALL cross-resource references correctly using CloudFormation intrinsic functions.
+- Follow AWS security best practices: least-privilege IAM, restricted ingress unless \
 public_access_allowed is true, encryption enabled where supported, deletion protection on \
 stateful resources in production.
 
@@ -88,23 +88,6 @@ stateful resources in production.
 - The template MUST include: AWSTemplateFormatVersion, Description, Parameters, Resources, Outputs.
 - Use a Parameters section with at least an Environment parameter.
 - Add an Outputs section that exports the StackName and the logical IDs of key resources.
-- Use Fn:: intrinsic function dict form ONLY. YAML tag shorthand crashes the parser:
-    FORBIDDEN: !Ref, !Sub, !GetAtt, !Select, !Join, !If, !Equals, !Split,
-               !FindInMap, !Base64, !Condition, !ImportValue, !Transform
-  Required equivalents:
-    !Ref LogicalName           -> {Ref: LogicalName}
-    !Sub 'string ${Var}'    -> {Fn::Sub: 'string ${Var}'}
-    !GetAtt Res.Attr           -> {Fn::GetAtt: [Res, Attr]}
-    !Select [0, list]          -> {Fn::Select: [0, list]}
-    !Join [",", list]          -> {Fn::Join: [",", list]}
-    !If [cond, a, b]           -> {Fn::If: [cond, a, b]}
-    !Split [",", str]          -> {Fn::Split: [",", str]}
-    !FindInMap [M, K1, K2]     -> {Fn::FindInMap: [M, K1, K2]}
-    !Base64 value              -> {Fn::Base64: value}
-    !ImportValue export        -> {Fn::ImportValue: export}
-- For development: t3.micro / db.t3.micro / 128 MB Lambda, no deletion protection.
-- For production: t3.small+ / db.t3.small+ / 256 MB+ Lambda, enable deletion protection \
-on stateful resources (RDS, DynamoDB, S3).
 
 ## Specification
 
@@ -113,9 +96,6 @@ Resources to generate:
 
 Constraints:
 {constraints_spec}
-
-Previous remediation hints (apply these corrections):
-{remediation_hints}
 """
 
 
@@ -134,37 +114,6 @@ CloudFormation template that has failed validation.
 
 - Output ONLY the complete fixed YAML template. Start with AWSTemplateFormatVersion.
 - No markdown fences, no prose, no explanations.
-- CRITICAL: The template you are fixing may already contain YAML tag shorthand (!Ref, !Sub,
-  !GetAtt, etc.). You MUST convert EVERY occurrence to dict form in your output.
-  Search the entire template for any line containing a YAML tag (starting with !) and
-  replace it. Missing even one will cause a YAML parse failure.
-- Use Fn:: intrinsic function dict form ONLY. YAML tag shorthand crashes the parser:
-    FORBIDDEN: !Ref, !Sub, !GetAtt, !Select, !Join, !If, !Equals, !Split,
-               !FindInMap, !Base64, !Condition, !ImportValue, !Transform
-  Required dict-form equivalents:
-    !Ref LogicalName           ->   Ref: LogicalName
-    !Sub 'string ${Var}'       ->   Fn::Sub: 'string ${Var}'
-    !GetAtt Res.Attr           ->   Fn::GetAtt: [Res, Attr]
-    !Select [0, list]          ->   Fn::Select: [0, list]
-    !Join [",", list]          ->   Fn::Join: [",", list]
-    !If [cond, a, b]           ->   Fn::If: [cond, a, b]
-    !Split [",", str]          ->   Fn::Split: [",", str]
-    !FindInMap [M, K1, K2]     ->   Fn::FindInMap: [M, K1, K2]
-    !Base64 value              ->   Fn::Base64: value
-    !ImportValue export        ->   Fn::ImportValue: export
-
-## Common fixes by finding type
-
-- YAML001 (syntax error): Fix indentation, quoting, and structure issues.
-  If the error mentions a YAML tag (!Ref, !Sub, etc.) convert ALL such tags
-  to dict form throughout the entire template -- not just the reported line.
-- INTENT / COVERAGE / AC-* (missing resources or properties): Add the missing resources
-  or properties that satisfy the intent. Do not just patch -- ensure the template fully
-  fulfils the original infrastructure goal.
-- CKV_AWS_* (Checkov security): Apply the specific security configuration required by
-  each rule (e.g. encryption, public access blocks, Multi-AZ, versioning, backups).
-- cfn-lint (schema errors): Fix property names, types, and required fields per the
-  CloudFormation resource schema.
 """
 
 
