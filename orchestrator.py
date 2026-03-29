@@ -8,11 +8,21 @@ The Orchestrator is NOT an LLM agent - it is a pure state machine that:
 1. Manages the GOD (Grounded Objectives Document) lifecycle
 2. Routes to skills based on GOD state
 3. Enforces validation gates (no forward progress on failures)
-4. Implements feedback loops with loop guards
+4. Implements feedback loops — the ONLY stop condition is max_total_iterations
 5. Produces complete audit trails
 
+Loop-guard policy (v1.5.0)
+--------------------------
+There is exactly ONE stop condition: ``max_total_iterations``.
+
+The old ``max_remediation_rounds`` check has been removed from the routing
+logic.  As long as iterations remain, the pipeline WILL keep trying to fix
+the template.  ESCALATED is only reachable when the iteration counter is
+exhausted.  All validations MUST be PASS (or SKIPPED/ERROR for unavailable
+tools) before the pipeline can reach SUCCEEDED.
+
 Author: INFRA-SKILL
-Version: 1.4.1  (restore create_default_skills)
+Version: 1.5.0
 """
 
 from __future__ import annotations
@@ -78,10 +88,14 @@ def create_default_skills() -> list[Skill]:
 class OrchestratorConfig:
     """Configuration for the Orchestrator"""
 
-    # Loop guards
-    max_remediation_rounds: int = 5
+    # Loop guard — the ONLY stop condition.
+    # max_remediation_rounds is kept for telemetry/reporting purposes only;
+    # it no longer gates any state transition.
     max_total_iterations: int = 50
     max_skill_retries: int = 50
+
+    # Kept for telemetry reporting — NOT used in routing logic.
+    max_remediation_rounds: int = 50
 
     # Validation behavior
     fail_on_critical_findings: bool = True
@@ -108,8 +122,8 @@ class OrchestratorConfig:
 
     def to_dict(self) -> dict:
         return {
-            "max_remediation_rounds": self.max_remediation_rounds,
             "max_total_iterations": self.max_total_iterations,
+            "max_remediation_rounds": self.max_remediation_rounds,
             "fail_on_critical_findings": self.fail_on_critical_findings,
             "fail_on_high_findings": self.fail_on_high_findings,
             "enable_checkpoints": self.enable_checkpoints,
@@ -191,14 +205,17 @@ class Orchestrator:
     """
     Deterministic state machine coordinating the INFRA-SKILL pipeline.
 
-    v1.4.1 change: restored create_default_skills() at module level so that
-    benchmark.py can do:
-        from orchestrator import Orchestrator, OrchestratorConfig, create_default_skills
+    v1.5.0 — single loop guard
+    --------------------------
+    The only way to reach ESCALATED is by exhausting ``max_total_iterations``.
+    RemediationSkill.can_trigger() no longer has a round cap, and
+    _determine_target_state() no longer checks get_remediation_round().
+    The pipeline will keep cycling VALIDATING → REMEDIATING → VALIDATING
+    until either every validator returns PASS/SKIPPED/ERROR (→ SUCCEEDED)
+    or the iteration budget is spent (→ ESCALATED).
 
-    v1.4.0 change: TelemetryRecorder is created per-run and injected into
-    every SkillContext via context.config["telemetry"].  Skills call
-    tel.record_llm_call() directly, keeping the telemetry path decoupled
-    from the orchestrator's hot loop.
+    v1.4.1 — restored create_default_skills() at module level.
+    v1.4.0 — TelemetryRecorder injected per-run via SkillContext.
     """
 
     _STAGE_ORDER: list[OrchestratorState] = [
@@ -274,17 +291,30 @@ class Orchestrator:
     # -------------------------------------------------------------------------
 
     def _determine_target_state(self) -> OrchestratorState:
+        """
+        Resolve the next state from GOD facts alone.
+
+        Stop conditions (in priority order)
+        ------------------------------------
+        1. Already terminal                    → stay terminal
+        2. max_total_iterations exhausted      → ESCALATED  (ONLY stop condition)
+        3. All validators PASS/SKIPPED/ERROR   → SUCCEEDED
+        4. Any FAIL with blocking findings     → REMEDIATING
+        5. No intent resources yet             → PLANNING
+        6. No template body yet                → ENGINEERING / ASSEMBLING
+        7. Default                             → VALIDATING
+        """
         if self.god is None:
             return OrchestratorState.UNINITIALIZED
 
         if self.state.is_terminal():
             return self.state
 
-        if self.god.get_remediation_round() >= self.config.max_remediation_rounds:
-            return OrchestratorState.ESCALATED
+        # ── Single stop condition ────────────────────────────────────────────
         if self._iteration >= self.config.max_total_iterations:
             return OrchestratorState.ESCALATED
 
+        # ── Success ─────────────────────────────────────────────────────────
         if self.god.all_validations_passed():
             if self.god.has_error_validations():
                 error_names = [
@@ -297,9 +327,11 @@ class Orchestrator:
                 )
             return OrchestratorState.SUCCEEDED
 
+        # ── Remediation loop ─────────────────────────────────────────────────
         if self.god.has_remediable_failures():
             return OrchestratorState.REMEDIATING
 
+        # ── Forward planning / engineering ───────────────────────────────────
         if not self.god.intent.resources:
             return OrchestratorState.PLANNING
 
@@ -339,7 +371,7 @@ class Orchestrator:
                 OrchestratorState.VALIDATING:  "template ready -- validate",
                 OrchestratorState.REMEDIATING: "validation failures -- remediate",
                 OrchestratorState.SUCCEEDED:   "all validations passed",
-                OrchestratorState.ESCALATED:   "loop guard triggered",
+                OrchestratorState.ESCALATED:   "max iterations exhausted",
             }
             self._transition_to(target_state, reason_map.get(target_state, "auto-transition"))
 
@@ -564,18 +596,11 @@ class Orchestrator:
                     pass
                 elif self.god.all_validations_passed():
                     self._transition_to(OrchestratorState.SUCCEEDED, "all validations passed")
-                elif self.god.has_remediable_failures():
-                    if self.god.get_remediation_round() >= self.config.max_remediation_rounds:
-                        self._transition_to(OrchestratorState.ESCALATED, "max remediation rounds exceeded")
-                        self.events.emit(OrchestratorEventType.LOOP_GUARD_TRIGGERED, {
-                            "remediation_rounds": self.god.get_remediation_round()
-                        })
-                    else:
-                        self._transition_to(
-                            OrchestratorState.FAILED,
-                            f"no skills can remediate failures in phase {self._current_phase}"
-                        )
                 else:
+                    # No skill could trigger but we are not yet succeeded and
+                    # not yet at max_total_iterations.  This means the pipeline
+                    # is genuinely stuck (e.g. all validators ERROR/SKIPPED and
+                    # no findings to remediate, yet template body is missing).
                     self._transition_to(
                         OrchestratorState.FAILED,
                         f"pipeline stuck -- no triggerable skills in phase {self._current_phase}"
@@ -619,6 +644,21 @@ class Orchestrator:
                     f"  Skill failed (attempt {consec}/{self.config.max_skill_retries}), "
                     "retrying same phase next iteration."
                 )
+
+        # Out of iteration budget
+        if not self.state.is_terminal():
+            self._logger.warning(
+                f"max_total_iterations ({self.config.max_total_iterations}) exhausted "
+                f"with unresolved findings. Escalating."
+            )
+            self._transition_to(
+                OrchestratorState.ESCALATED,
+                f"max_total_iterations ({self.config.max_total_iterations}) exhausted"
+            )
+            self.events.emit(OrchestratorEventType.LOOP_GUARD_TRIGGERED, {
+                "iterations": self._iteration,
+                "max_total_iterations": self.config.max_total_iterations,
+            })
 
         self._end_time = datetime.now()
         duration_ms = (self._end_time - self._start_time).total_seconds() * 1000
