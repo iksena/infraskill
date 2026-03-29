@@ -1,129 +1,81 @@
 # -----------------------------------------------------------------------------
-# ENGINEERING SKILLS
+# ENGINEERING SKILL  v2.0.0  — pure LLM, whole-template generation
+# -----------------------------------------------------------------------------
+#
+# The engineer is a pure LLM skill. A single LLM call receives the full
+# infrastructure specification (resources + constraints + remediation hints)
+# and produces a COMPLETE, deployment-ready CloudFormation template.
+#
+# There is no block-by-block generation loop and no string manipulation of
+# YAML. Cross-resource references (Fn::Sub, Fn::GetAtt, Ref) are resolved by
+# the LLM natively.
+#
+# TemplateAssemblerSkill is removed. The engineer output IS the assembled
+# template. The orchestrator should transition directly from ENGINEERING to
+# VALIDATION after this skill succeeds.
 # -----------------------------------------------------------------------------
 
+import json
 from typing import Optional
 
 from enums import SkillPhase
-from god import Constraints, GroundedObjectivesDocument
+from god import GroundedObjectivesDocument
 from llm_client import OpenRouterClient
 from prompt import ENGINEER_SYSTEM_PROMPT
 from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
 
 
-class BaseEngineerSkill(Skill):
-    """Base class for resource engineering skills."""
-
-    def __init__(self):
-        super().__init__()
-        self.resource_types: list[str] = []
-
-    def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
-        if not god.intent.resources:
-            return False
-        for resource in god.intent.resources:
-            if resource.resource_type in self.resource_types and not resource.generated:
-                return True
-        return False
-
-    def _mark_generated(self, god: GroundedObjectivesDocument, resource_type: str):
-        for r in god.intent.resources:
-            if r.resource_type == resource_type:
-                r.generated = True
-
-    def _generate_block(
-        self,
-        context: SkillContext,
-        resource_type: str,
-        logical_name: str,
-        constraints: Constraints,
-        existing_refs: list[str],
-        properties_hints: dict | None = None,
-    ) -> str:
-        llm: OpenRouterClient = context.get_config("llm")
-        c = constraints
-        hints_text = ""
-        if properties_hints:
-            hints_text = "\n## Property hints from planner\n" + "\n".join(
-                f"  {k}: {v}" for k, v in properties_hints.items()
-            )
-
-        system = ENGINEER_SYSTEM_PROMPT.format(
-            resource_type=resource_type,
-            logical_name=logical_name,
-            environment=c.environment,
-            multi_az=c.multi_az,
-            encryption_at_rest=c.encryption_at_rest,
-            encryption_in_transit=c.encryption_in_transit,
-            public_access_allowed=c.public_access_allowed,
-            backup_enabled=c.backup_enabled,
-            backup_retention_days=c.backup_retention_days,
-            logging_enabled=c.logging_enabled,
-            compliance_frameworks=", ".join(c.compliance_frameworks) or "none",
-            existing_refs="\n".join(f"  - {r}" for r in existing_refs) or "  (none yet)",
-            properties_hints=hints_text,
-        )
-
-        return llm.complete(
-            system=system,
-            user=f"Generate the {resource_type} block.",
-            temperature=0.1,
-        )
-
-
-class GeneralEngineerSkill(BaseEngineerSkill):
+class GeneralEngineerSkill(Skill):
     """
-    Universal engineer skill — generates ANY AWS CloudFormation resource block.
+    Generates a complete AWS CloudFormation template from the GOD specification.
 
-    Progressive disclosure
-    ----------------------
-    L1  metadata   — always resident
-    L2  re module  — imported lazily on first activation
-    L3  (none)     — no heavy assets
+    One LLM call produces the entire template — all resources, parameters,
+    outputs, and cross-resource references are handled by the LLM in a single
+    context window. This eliminates the stitching and indentation problems
+    caused by per-resource block generation.
     """
-
-    def __init__(self):
-        super().__init__()
-        self.resource_types = []  # empty = accepts all
 
     def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
             name="general-engineer",
-            version="1.1.0",
+            version="2.0.0",
             description=(
-                "Generates any AWS CloudFormation resource block using the LLM. "
-                "Processes resources in priority order as defined in the GOD intent."
+                "Generates a complete AWS CloudFormation template from the GOD "
+                "specification in a single LLM call."
             ),
             llm_description=(
-                "Given a request to generate a specific AWS CloudFormation resource "
-                "block, produce the YAML snippet that defines that resource. Use the "
-                "provided constraints and any hints from the planner to inform the "
-                "generation."
+                "Given a full infrastructure specification (resources, constraints, "
+                "remediation hints), produce a complete, deployment-ready "
+                "CloudFormation YAML template. All resources, parameters, outputs, "
+                "and cross-resource references must be included."
             ),
             phase=SkillPhase.ENGINEERING,
-            trigger_condition="Any ungenerated resource exists in intent.resources",
-            writes_to=["template.resources", "template.version"],
-            reads_from=["intent.resources", "intent.constraints"],
+            trigger_condition=(
+                "intent.resources is non-empty AND template.body is empty"
+            ),
+            writes_to=["template.body", "template.version"],
+            reads_from=[
+                "intent.resources",
+                "intent.constraints",
+                "template.remediation_hints",
+            ],
             priority=10,
             tags=["llm", "engineering", "cloudformation"],
             examples=[
                 {
-                    "input": {"resource_type": "AWS::S3::Bucket", "logical_name": "MainS3Bucket"},
-                    "output": "YAML block with BucketEncryption, PublicAccessBlockConfiguration, Tags",
+                    "input": {
+                        "resources": ["AWS::S3::Bucket", "AWS::IAM::Role"],
+                        "constraints": {"encryption_at_rest": True},
+                    },
+                    "output": "Complete CFN YAML with all resources, parameters, outputs",
                 }
             ],
         )
 
-    # L2: lazily import re
-    def load_level2(self) -> bool:
-        if not self._level2_loaded:
-            import re as _re
-            self._re = _re
-            self._level2_loaded = True
-        return True
-
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
-        return bool(god.intent.get_ungenerated_resources())
+        has_resources = bool(god.intent.resources)
+        no_template = not god.template.body
+        return has_resources and no_template
 
     def execute(self, context: SkillContext) -> SkillResult:
         god = context.god
@@ -133,158 +85,89 @@ class GeneralEngineerSkill(BaseEngineerSkill):
         if llm is None:
             return SkillResult.failure(
                 self.metadata.name,
-                "No LLM client configured — cannot generate resource blocks",
+                "No LLM client configured — cannot generate CloudFormation template.",
             )
 
-        constraints = god.intent.constraints
-        pending = god.intent.get_ungenerated_resources()
-
-        for resource in pending:
-            existing_refs = list(god.template.resources.keys())
-            properties_hints = resource.properties_hints
-
-            try:
-                block = self._generate_block(
-                    context=context,
-                    resource_type=resource.resource_type,
-                    logical_name=resource.logical_name,
-                    constraints=constraints,
-                    existing_refs=existing_refs,
-                    properties_hints=properties_hints,
-                )
-                # Strip trailing code-fence markers the LLM sometimes emits
-                clean_block = self._re.sub(r'\n?```\s*$', '', block)
-                if not clean_block.endswith('\n'):
-                    clean_block += '\n'
-
-            except Exception as e:
-                result.success = False
-                result.errors.append(
-                    f"Failed to generate {resource.logical_name} "
-                    f"({resource.resource_type}): {e}"
-                )
-                continue
-
-            god.template.resources[resource.logical_name] = clean_block
-            resource.generated = True
-            god.template.increment_version(self.metadata.name)
-            result.changes_made.append(
-                f"Generated {resource.resource_type} \u2192 {resource.logical_name}"
-            )
-
-        return result
-
-
-# -----------------------------------------------------------------------------
-# ASSEMBLY SKILL
-# -----------------------------------------------------------------------------
-
-class TemplateAssemblerSkill(Skill):
-    """
-    Assembles individual resource blocks into a complete CloudFormation template.
-
-    Resource ordering follows the GOD priority (set by PlannerSkill) rather than
-    a hardcoded list, so any resource type the planner adds is handled correctly.
-
-    IMPORTANT — YAML tag safety
-    ---------------------------
-    We use yaml.safe_load everywhere for validation, which rejects YAML custom
-    tags like !Ref, !Sub, !GetAtt.  The header and outputs sections below
-    therefore use only the Fn:: dict form so safe_load never sees unknown tags.
-    The LLM-generated resource blocks may still contain tag shorthand, but those
-    are stitched in between our safe header/footer so the assembler itself stays
-    tag-free.
-    """
-
-    # -------------------------------------------------------------------------
-    # Top-level template skeleton
-    # -------------------------------------------------------------------------
-    # Rules:
-    #   1. NO leading spaces on top-level keys — yaml.safe_load is strict about
-    #      indentation; any indent here produces the 'expected <block end>,
-    #      found <block mapping start>' error.
-    #   2. NO !Ref / !Sub / !GetAtt shorthand — use Fn:: dict form so that
-    #      yaml.safe_load (used by YAMLSyntaxValidatorSkill and RemediationSkill)
-    #      can parse the header without a custom Loader.
-    # -------------------------------------------------------------------------
-
-    CFN_HEADER = """\
-AWSTemplateFormatVersion: '2010-09-09'
-Description: Infrastructure generated by INFRA-SKILL
-
-Parameters:
-  Environment:
-    Type: String
-    Default: production
-    AllowedValues:
-      - development
-      - staging
-      - production
-    Description: Environment name
-
-Resources:
-"""
-
-    CFN_OUTPUTS = """\
-Outputs:
-  StackName:
-    Description: Stack Name
-    Value:
-      Ref: AWS::StackName
-"""
-
-    def _define_metadata(self) -> SkillMetadata:
-        return SkillMetadata(
-            name="template-assembler",
-            version="1.2.0",
-            description="Assembles resource blocks into a complete CFN template in dependency order.",
-            llm_description=(
-                "Combines individually generated CloudFormation resource YAML blocks "
-                "into a single valid template with header, Resources section, and Outputs."
-            ),
-            phase=SkillPhase.ASSEMBLY,
-            trigger_condition=(
-                "template.resources is non-empty AND "
-                "template.body does not contain AWSTemplateFormatVersion"
-            ),
-            writes_to=["template.body", "template.version"],
-            reads_from=["template.resources"],
-            priority=10,
-            tags=["assembly", "cloudformation"],
+        # Build the resources spec as a readable JSON block for the prompt.
+        resources_spec = json.dumps(
+            [
+                {
+                    "resource_type": r.resource_type,
+                    "logical_name": r.logical_name,
+                    "priority": r.priority,
+                    "dependencies": r.dependencies,
+                    "properties_hints": r.properties_hints or {},
+                }
+                for r in god.intent.resources
+            ],
+            indent=2,
         )
 
-    def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
-        has_resources = bool(god.template.resources)
-        no_body = not god.template.body or "AWSTemplateFormatVersion" not in god.template.body
-        return has_resources and no_body
+        constraints = god.intent.constraints
+        constraints_spec = json.dumps(
+            {
+                "environment": constraints.environment,
+                "multi_az": constraints.multi_az,
+                "encryption_at_rest": constraints.encryption_at_rest,
+                "encryption_in_transit": constraints.encryption_in_transit,
+                "public_access_allowed": constraints.public_access_allowed,
+                "backup_enabled": constraints.backup_enabled,
+                "backup_retention_days": constraints.backup_retention_days,
+                "logging_enabled": constraints.logging_enabled,
+                "monitoring_enabled": constraints.monitoring_enabled,
+                "compliance_frameworks": constraints.compliance_frameworks,
+                "cost_optimization": constraints.cost_optimization,
+            },
+            indent=2,
+        )
 
-    def execute(self, context: SkillContext) -> SkillResult:
-        god = context.god
-        result = SkillResult(success=True, skill_name=self.metadata.name)
+        remediation_hints = getattr(god.template, "remediation_hints", "") or "(none)"
 
-        # Order by the priority already set on each ExtractedResource by PlannerSkill.
-        priority_map: dict[str, int] = {
-            r.logical_name: r.priority for r in god.intent.resources
-        }
+        system = ENGINEER_SYSTEM_PROMPT.format(
+            resources_spec=resources_spec,
+            constraints_spec=constraints_spec,
+            remediation_hints=remediation_hints,
+        )
 
-        def _sort_key(name: str) -> int:
-            return priority_map.get(name, 999)
-
-        resources_yaml = ""
-        for name in sorted(god.template.resources.keys(), key=_sort_key):
-            block = god.template.resources[name]
-            # Indent each resource block by 2 spaces so it sits inside Resources:
-            indented = "\n".join(
-                "  " + line if line.strip() else line
-                for line in block.splitlines()
+        try:
+            template_body = llm.complete(
+                system=system,
+                user="Generate the complete CloudFormation template.",
+                temperature=0.1,
             )
-            resources_yaml += indented.rstrip() + "\n"
+        except Exception as e:
+            return SkillResult.failure(
+                self.metadata.name,
+                f"LLM call failed during template generation: {e}",
+            )
 
-        god.template.body = self.CFN_HEADER + resources_yaml + "\n" + self.CFN_OUTPUTS
+        # Strip any markdown fences the LLM may have wrapped the output in.
+        template_body = self._strip_fences(template_body)
+
+        if "AWSTemplateFormatVersion" not in template_body:
+            return SkillResult.failure(
+                self.metadata.name,
+                "LLM output does not appear to be a CloudFormation template "
+                "(missing AWSTemplateFormatVersion). Raw output logged at DEBUG.",
+            )
+
+        god.template.body = template_body
+        god.template.resources = {}  # not used in whole-template mode
         god.template.update_checksum()
         god.template.increment_version(self.metadata.name)
 
         result.changes_made.append(
-            f"Assembled {len(god.template.resources)} resources into template"
+            f"Generated complete CFN template ({len(template_body)} chars, "
+            f"{len(god.intent.resources)} resources)"
         )
         return result
+
+    @staticmethod
+    def _strip_fences(text: str) -> str:
+        """Remove optional markdown code fences from an LLM response."""
+        lines = text.strip().splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
