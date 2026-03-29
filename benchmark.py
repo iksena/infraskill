@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Optional
 
 from logger import setup_logging
-from orchestrator import OrchestratorConfig, create_orchestrator
+from orchestrator import Orchestrator, OrchestratorConfig, create_default_skills
 from llm_client import OpenRouterClient
 
 # ---------------------------------------------------------------------------
@@ -176,18 +176,33 @@ class BenchmarkRunner:
             self._logger.info(f"Resuming – {len(completed)} rows already done")
         return completed
 
-    def _build_orchestrator_config(self) -> OrchestratorConfig:
-        """Build an OrchestratorConfig, applying any overrides."""
-        base = dict(
+    def _build_orchestrator(self) -> Orchestrator:
+        """
+        Build a fully-wired Orchestrator.
+
+        FIX: Previously this method returned an OrchestratorConfig and called
+             create_orchestrator(config) — which passes the config object as the
+             positional `llm_client` argument, storing the entire OrchestratorConfig
+             as llm_client.  Every skill then called config.complete(...) and crashed
+             with: 'OrchestratorConfig' object has no attribute 'complete'.
+
+        The correct pattern is to build OrchestratorConfig with llm_client set to a
+        real OpenRouterClient, then construct Orchestrator(config) directly.
+        """
+        llm = OpenRouterClient(model=self.model)
+
+        base_kwargs = dict(
             max_remediation_rounds=3,
             max_total_iterations=30,
-            verbose_logging=False,     # Keep logs lean during batch runs
+            verbose_logging=False,
             log_god_snapshots=False,
-            enable_checkpoints=False,  # Skip checkpoints for speed
-            llm_client=OpenRouterClient(model=self.model),
+            enable_checkpoints=False,
+            llm_client=llm,            # ← OpenRouterClient, not OrchestratorConfig
         )
-        base.update(self.config_overrides)
-        return OrchestratorConfig(**base)
+        base_kwargs.update(self.config_overrides)
+
+        config = OrchestratorConfig(**base_kwargs)
+        return Orchestrator(config).with_skills(create_default_skills())
 
     # ------------------------------------------------------------------
     # Single scenario execution
@@ -209,9 +224,7 @@ class BenchmarkRunner:
         self._logger.info(f"[Row {row:>4}] Starting – {prompt[:80]}...")
 
         try:
-            config = self._build_orchestrator_config()
-            orchestrator = create_orchestrator(config)
-
+            orchestrator = self._build_orchestrator()
             orch_result = orchestrator.run(prompt)
 
             result.success = orch_result["success"]
