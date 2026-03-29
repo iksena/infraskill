@@ -1,15 +1,8 @@
 # -----------------------------------------------------------------------------
-# REMEDIATION SKILL  v3.1.0  — pure LLM, no deterministic patches
-# -----------------------------------------------------------------------------
-#
-# BUG 3 FIX: Only add a RemediationEntry when the LLM call fully succeeded
-# and wrote a valid template back.  Previously a timed-out LLM call could
-# still add a 'patch' entry (success=False) which incremented
-# get_remediation_round() and caused the loop guard to fire early.
-#
-# All other remediation logic is unchanged.
+# REMEDIATION SKILL  v3.2.0  — pure LLM + telemetry instrumentation
 # -----------------------------------------------------------------------------
 
+import time
 from typing import Optional
 
 from enums import SkillPhase
@@ -17,9 +10,8 @@ from god import GroundedObjectivesDocument, RemediationEntry, ValidationFinding
 from llm_client import OpenRouterClient
 from prompt import REMEDIATION_SYSTEM_PROMPT
 from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
+from telemetry import TelemetryRecorder
 
-# Rule ID prefixes that indicate the template must be regenerated from scratch
-# (missing resources / intent violations) rather than patched in place.
 _REPLAN_PREFIXES = ("INTENT", "COVERAGE", "AC-")
 
 
@@ -28,15 +20,8 @@ class RemediationSkill(Skill):
     Fixes a CloudFormation template that has failed validation.
 
     Two paths, both LLM-driven:
-
     1. In-place fix  — security, schema, and YAML syntax findings.
-       The LLM receives the full template + findings and returns the
-       complete corrected template.
-
     2. Re-plan       — intent/coverage/AC-* findings.
-       The template AND intent.resources are cleared so PlannerSkill
-       re-triggers on the next pipeline iteration, incorporating all
-       accumulated remediation_hints.
     """
 
     def _define_metadata(self) -> SkillMetadata:
@@ -54,7 +39,7 @@ class RemediationSkill(Skill):
             writes_to=["template.body", "template.version", "remediation_log"],
             reads_from=["template.body", "validation_state"],
             priority=10,
-            version="3.1.0",
+            version="3.2.0",
             tags=["llm", "remediation", "cloudformation"],
         )
 
@@ -74,6 +59,8 @@ class RemediationSkill(Skill):
         skill_result = SkillResult(success=True, skill_name=self.metadata.name)
         round_num = god.get_remediation_round() + 1
         self._logger.info(f"Remediation round {round_num}")
+        tel: Optional[TelemetryRecorder] = context.get_config("telemetry")
+        iteration: int = context.iteration
 
         blocking_findings = god.get_blocking_findings()
         if not blocking_findings:
@@ -87,11 +74,6 @@ class RemediationSkill(Skill):
                 "No LLM client configured. RemediationSkill requires an LLM.",
             )
 
-        # ------------------------------------------------------------------
-        # Decide path: intent/coverage findings require a full re-plan;
-        # all other findings (YAML syntax, security, schema) are fixed
-        # in-place by the LLM.
-        # ------------------------------------------------------------------
         intent_findings = [
             f for f in blocking_findings
             if any(f.rule_id.startswith(p) for p in _REPLAN_PREFIXES)
@@ -101,20 +83,13 @@ class RemediationSkill(Skill):
             if not any(f.rule_id.startswith(p) for p in _REPLAN_PREFIXES)
         ]
 
-        # Accumulate remediation hints for both paths.
         self._accumulate_hints(god, round_num, blocking_findings)
 
         if intent_findings and not fixable_findings:
-            # All findings are intent-level — re-plan from scratch.
-            return self._reset_for_replanning(god, skill_result, round_num, intent_findings)
+            return self._reset_for_replanning(god, skill_result, round_num, intent_findings, tel, iteration)
 
-        # For mixed findings, include intent findings in the LLM fix prompt
-        # so the LLM can add missing resources as well as fix security issues.
         findings_to_fix = fixable_findings or blocking_findings
-
-        return self._llm_fix(
-            god, skill_result, llm, round_num, findings_to_fix
-        )
+        return self._llm_fix(god, skill_result, llm, round_num, findings_to_fix, tel, iteration)
 
     # =========================================================================
     # LLM in-place fix
@@ -127,6 +102,8 @@ class RemediationSkill(Skill):
         llm: OpenRouterClient,
         round_num: int,
         findings: list[ValidationFinding],
+        tel: Optional[TelemetryRecorder],
+        iteration: int,
     ) -> SkillResult:
         findings_text = "\n".join(
             f"- [{f.severity.name}] {f.rule_id} on '{f.resource_name}': "
@@ -135,29 +112,55 @@ class RemediationSkill(Skill):
         )
 
         remediation_hints = getattr(god.template, "remediation_hints", "") or "(none)"
+        user_message = (
+            f"## Current template\n"
+            f"```yaml\n{god.template.body}\n```\n\n"
+            f"## Validation findings to fix (round {round_num})\n"
+            f"{findings_text}\n\n"
+            f"## Accumulated context from previous rounds\n"
+            f"{remediation_hints}"
+        )
 
         self._logger.info(
             f"  [llm-fix] Sending {len(findings)} findings to LLM (round {round_num})"
         )
 
+        t0 = time.monotonic()
         try:
             fixed_template = llm.complete(
                 system=REMEDIATION_SYSTEM_PROMPT,
-                user=(
-                    f"## Current template\n"
-                    f"```yaml\n{god.template.body}\n```\n\n"
-                    f"## Validation findings to fix (round {round_num})\n"
-                    f"{findings_text}\n\n"
-                    f"## Accumulated context from previous rounds\n"
-                    f"{remediation_hints}"
-                ),
+                user=user_message,
                 temperature=0.0,
             )
+            llm_ok = True
+            llm_err = None
         except Exception as e:
+            fixed_template = ""
+            llm_ok = False
+            llm_err = str(e)
+        llm_ms = (time.monotonic() - t0) * 1000
+
+        if tel:
+            tel.record_llm_call(
+                skill_name=self.metadata.name,
+                iteration=iteration,
+                call_purpose=f"remediate_round_{round_num}",
+                system_prompt=REMEDIATION_SYSTEM_PROMPT,
+                user_message=user_message,
+                raw_response=fixed_template,
+                duration_ms=llm_ms,
+                success=llm_ok,
+                error=llm_err,
+                extra={
+                    "round_num": round_num,
+                    "finding_count": len(findings),
+                    "finding_ids": [f.rule_id for f in findings],
+                },
+            )
+
+        if not llm_ok:
             skill_result.success = False
-            skill_result.errors.append(f"LLM call failed: {e}")
-            # BUG 3 FIX: Do NOT add a RemediationEntry on failure.
-            # A failed/timed-out call must not increment get_remediation_round().
+            skill_result.errors.append(f"LLM call failed: {llm_err}")
             return skill_result
 
         fixed_template = self._strip_fences(fixed_template)
@@ -168,16 +171,23 @@ class RemediationSkill(Skill):
                 "LLM remediation did not return a valid CloudFormation template "
                 "(missing AWSTemplateFormatVersion)."
             )
-            # BUG 3 FIX: Do NOT add a RemediationEntry on failure.
             return skill_result
 
+        before_body = god.template.body
         god.template.body = fixed_template
         god.template.update_checksum()
         god.template.increment_version(self.metadata.name)
         god.reset_validations_from("yaml_syntax", self.metadata.name, skip_errored=True)
 
-        # BUG 3 FIX: Only add the RemediationEntry AFTER confirming success,
-        # so get_remediation_round() only increments on real completed rounds.
+        if tel:
+            tel.record_god_change(
+                field="template.body",
+                before=before_body,
+                after=fixed_template,
+                changed_by=self.metadata.name,
+                iteration=iteration,
+            )
+
         god.add_remediation_entry(RemediationEntry(
             round=round_num,
             skill_name=self.metadata.name,
@@ -197,7 +207,7 @@ class RemediationSkill(Skill):
         return skill_result
 
     # =========================================================================
-    # Re-plan path (intent / coverage failures)
+    # Re-plan path
     # =========================================================================
 
     def _reset_for_replanning(
@@ -206,30 +216,41 @@ class RemediationSkill(Skill):
         skill_result: SkillResult,
         round_num: int,
         intent_findings: list[ValidationFinding],
+        tel: Optional[TelemetryRecorder],
+        iteration: int,
     ) -> SkillResult:
-        """
-        Clear both the assembled template AND intent.resources so that
-        PlannerSkill.can_trigger() returns True on the next iteration.
-        The planner re-runs with god.template.remediation_hints as context.
-        """
         self._logger.info(
             f"  [replan] {len(intent_findings)} intent/coverage findings -- "
             "clearing template and resources for re-planning"
         )
 
+        before_body = god.template.body
+        before_resources = list(god.intent.resources) if god.intent.resources else []
+
         god.template.body = ""
         god.template.resources = {}
         god.template.increment_version(self.metadata.name)
-
-        # Clear intent so PlannerSkill.can_trigger() fires.
         god.intent.resources = []
         god.intent.acceptance_criteria = []
         god.intent.parsed_at = None
-
         god.reset_validations_from("yaml_syntax", self.metadata.name, skip_errored=False)
 
-        # action_type='plan' is deliberately NOT 'patch' or 'escalate', so
-        # get_remediation_round() does NOT count re-plan entries.
+        if tel:
+            tel.record_god_change(
+                field="template.body",
+                before=before_body,
+                after="(cleared for replan)",
+                changed_by=self.metadata.name,
+                iteration=iteration,
+            )
+            tel.record_god_change(
+                field="intent.resources",
+                before=[r.resource_type for r in before_resources],
+                after="(cleared for replan)",
+                changed_by=self.metadata.name,
+                iteration=iteration,
+            )
+
         god.add_remediation_entry(RemediationEntry(
             round=round_num,
             skill_name=self.metadata.name,
@@ -262,7 +283,6 @@ class RemediationSkill(Skill):
         round_num: int,
         findings: list[ValidationFinding],
     ) -> None:
-        """Append current findings as remediation hints on the GOD template."""
         new_hints = "\n".join(
             f"- [{f.rule_id}] on '{f.resource_name}': {f.message}. "
             f"Hint: {f.remediation_hint or 'n/a'}"
@@ -276,7 +296,6 @@ class RemediationSkill(Skill):
 
     @staticmethod
     def _strip_fences(text: str) -> str:
-        """Remove optional markdown code fences from an LLM response."""
         lines = text.strip().splitlines()
         if lines and lines[0].startswith("```"):
             lines = lines[1:]

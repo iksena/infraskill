@@ -12,7 +12,7 @@ The Orchestrator is NOT an LLM agent - it is a pure state machine that:
 5. Produces complete audit trails
 
 Author: INFRA-SKILL
-Version: 1.3.0  (timeout-advance fix, loop-guard fix, consecutive-failure guard)
+Version: 1.4.0  (telemetry integration)
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from skills.engineer import GeneralEngineerSkill
 from skills.planner import PlannerSkill
 from skills.remediation import RemediationSkill
 from skills.validator import CFNLintValidatorSkill, CheckovValidatorSkill, IntentAlignmentValidatorSkill, YAMLSyntaxValidatorSkill
+from telemetry import TelemetryRecorder
 
 @dataclass
 class OrchestratorConfig:
@@ -67,13 +68,19 @@ class OrchestratorConfig:
 
     llm_client: Optional[object] = None
 
+    # Telemetry
+    telemetry_dir: str = "telemetry"
+    enable_telemetry: bool = True
+
     def to_dict(self) -> dict:
         return {
             "max_remediation_rounds": self.max_remediation_rounds,
             "max_total_iterations": self.max_total_iterations,
             "fail_on_critical_findings": self.fail_on_critical_findings,
             "fail_on_high_findings": self.fail_on_high_findings,
-            "enable_checkpoints": self.enable_checkpoints
+            "enable_checkpoints": self.enable_checkpoints,
+            "enable_telemetry": self.enable_telemetry,
+            "telemetry_dir": self.telemetry_dir,
         }
 
 
@@ -150,39 +157,10 @@ class Orchestrator:
     """
     Deterministic state machine coordinating the INFRA-SKILL pipeline.
 
-    Pipeline stages (in order):
-        PLANNING -> ENGINEERING -> ASSEMBLING -> VALIDATING
-                                                   | (FAIL findings)
-                                              REMEDIATING
-                                                   |
-                                              VALIDATING  (repeat up to max_remediation_rounds)
-                                                   | (all pass or ERROR only)
-                                              SUCCEEDED
-
-    Key routing rule
-    ----------------
-    _determine_target_state() routes to REMEDIATING only when
-    god.has_remediable_failures() is True -- meaning at least one validator
-    is FAIL with blocking (CRITICAL/HIGH) findings.
-
-    Validators in ERROR state (tool not on PATH) are treated as SKIPPED:
-    they do NOT trigger remediation and do NOT block SUCCEEDED.  This
-    prevents the infinite loop where a missing tool (e.g. checkov) causes
-    perpetual VALIDATING -> REMEDIATING -> no-op -> FAILED.
-
-    FIX v1.3.0 -- Timeout / consecutive-failure guard
-    --------------------------------------------------
-    When a skill returns a failed result (including timeout), the orchestrator
-    now increments a per-skill consecutive-failure counter.  Once that counter
-    reaches max_skill_retries the pipeline transitions to FAILED immediately
-    rather than letting _determine_target_state() re-evaluate and silently
-    advance to the next phase.  This prevents the pattern:
-
-        planner TIMEOUT -> intent still empty -> _determine_target_state
-        sees template also empty -> routes ENGINEERING -> engineer receives
-        no spec -> produces garbage YAML with !Ref shorthand -> chaos.
-
-    The consecutive-failure counter is reset whenever a skill succeeds.
+    v1.4.0 change: TelemetryRecorder is created per-run and injected into
+    every SkillContext via context.config["telemetry"].  Skills call
+    tel.record_llm_call() directly, keeping the telemetry path decoupled
+    from the orchestrator's hot loop.
     """
 
     _STAGE_ORDER: list[OrchestratorState] = [
@@ -206,8 +184,8 @@ class Orchestrator:
         self._state_history: list[tuple[OrchestratorState, str, str]] = []
         self._start_time: Optional[datetime] = None
         self._end_time: Optional[datetime] = None
-        # BUG 1 FIX: per-skill consecutive failure counter
         self._consecutive_failures: dict[str, int] = defaultdict(int)
+        self._telemetry: Optional[TelemetryRecorder] = None
 
     # -------------------------------------------------------------------------
     # Builder Pattern
@@ -244,6 +222,12 @@ class Orchestrator:
             "new_state": new_state.name,
             "reason": reason
         })
+        if self._telemetry:
+            self._telemetry.record_orchestrator_event(
+                event_type="STATE_CHANGED",
+                iteration=self._iteration,
+                data={"old_state": old_state.name, "new_state": new_state.name, "reason": reason},
+            )
         if self.config.checkpoint_on_phase_change and self.god:
             self.god.save_checkpoint(f"state:{new_state.name}", "orchestrator")
 
@@ -252,35 +236,17 @@ class Orchestrator:
     # -------------------------------------------------------------------------
 
     def _determine_target_state(self) -> OrchestratorState:
-        """
-        Derive the required orchestrator state purely from GOD content.
-
-        REMEDIATING gate
-        ----------------
-        Uses has_remediable_failures() (FAIL + blocking findings) NOT
-        has_failed_validations() (FAIL or ERROR).  This is the critical
-        distinction:
-
-          FAIL   -> template has a real defect -> REMEDIATING
-          ERROR  -> tool missing from PATH    -> treat as SKIPPED, continue
-
-        Without this distinction, a missing checkov binary causes permanent
-        oscillation: VALIDATING -> REMEDIATING -> (no blocking findings) ->
-        no skill triggers -> FAILED.
-        """
         if self.god is None:
             return OrchestratorState.UNINITIALIZED
 
         if self.state.is_terminal():
             return self.state
 
-        # Loop guards
         if self.god.get_remediation_round() >= self.config.max_remediation_rounds:
             return OrchestratorState.ESCALATED
         if self._iteration >= self.config.max_total_iterations:
             return OrchestratorState.ESCALATED
 
-        # Success: all validators PASS, SKIPPED, or ERROR (tool absent)
         if self.god.all_validations_passed():
             if self.god.has_error_validations():
                 error_names = [
@@ -293,11 +259,9 @@ class Orchestrator:
                 )
             return OrchestratorState.SUCCEEDED
 
-        # Real failures with blocking findings -> remediate
         if self.god.has_remediable_failures():
             return OrchestratorState.REMEDIATING
 
-        # Forward progress: what is still missing in GOD?
         if not self.god.intent.resources:
             return OrchestratorState.PLANNING
 
@@ -323,15 +287,10 @@ class Orchestrator:
         return mapping.get(state)
 
     # -------------------------------------------------------------------------
-    # Deterministic skill selection (LLM as tiebreaker only)
+    # Skill selection
     # -------------------------------------------------------------------------
 
     def select_next_skill(self) -> Optional[Skill]:
-        """
-        Two-step skill selection:
-          1. Resolve required state via _determine_target_state() and transition.
-          2. Select from phase-gated candidates; LLM only as within-phase tiebreaker.
-        """
         target_state = self._determine_target_state()
 
         if target_state != self.state:
@@ -360,6 +319,13 @@ class Orchestrator:
                 "old_phase": old_phase.name if old_phase else None,
                 "new_phase": target_phase.name,
             })
+            if self._telemetry:
+                self._telemetry.record_orchestrator_event(
+                    event_type="PHASE_CHANGED",
+                    iteration=self._iteration,
+                    data={"old_phase": old_phase.name if old_phase else None,
+                          "new_phase": target_phase.name},
+                )
 
         phase_skills = self.registry.get_by_phase(target_phase)
         candidates = [s for s in phase_skills if s.can_trigger(self.god)]
@@ -370,7 +336,6 @@ class Orchestrator:
         if len(candidates) == 1:
             return candidates[0]
 
-        # LLM tiebreaker within phase
         llm = self.config.llm_client
         if llm is None:
             return candidates[0]
@@ -416,6 +381,7 @@ class Orchestrator:
             config={
                 "llm": self.config.llm_client,
                 "llm_timeout": max(30, timeout_s - 10),
+                "telemetry": self._telemetry,
             }
         )
         self.events.emit(OrchestratorEventType.SKILL_STARTED, {
@@ -423,6 +389,12 @@ class Orchestrator:
             "phase": skill.metadata.phase.name,
             "iteration": self._iteration
         })
+        if self._telemetry:
+            self._telemetry.record_orchestrator_event(
+                event_type="SKILL_STARTED",
+                iteration=self._iteration,
+                data={"skill_name": skill.metadata.name, "phase": skill.metadata.phase.name},
+            )
         start_time = datetime.now()
         can_proceed, abort_reason = skill.pre_execute(context)
         if not can_proceed:
@@ -469,7 +441,7 @@ class Orchestrator:
         return result
 
     def _record_execution(self, skill: Skill, result: SkillResult):
-        self._execution_log.append({
+        entry = {
             "iteration": self._iteration,
             "timestamp": datetime.now().isoformat(),
             "skill_name": skill.metadata.name,
@@ -479,7 +451,19 @@ class Orchestrator:
             "changes_made": result.changes_made,
             "errors": result.errors,
             "warnings": result.warnings
-        })
+        }
+        self._execution_log.append(entry)
+        if self._telemetry:
+            self._telemetry.record_skill_execution(
+                skill_name=skill.metadata.name,
+                phase=skill.metadata.phase.name,
+                iteration=self._iteration,
+                success=result.success,
+                duration_ms=result.duration_ms or 0.0,
+                changes_made=result.changes_made,
+                errors=result.errors,
+                warnings=result.warnings,
+            )
 
     # -------------------------------------------------------------------------
     # Main Execution Loop
@@ -494,7 +478,22 @@ class Orchestrator:
         self._iteration = 0
         self._execution_log = []
         self._state_history = []
-        self._consecutive_failures = defaultdict(int)  # reset per run
+        self._consecutive_failures = defaultdict(int)
+
+        # ------------------------------------------------------------------
+        # Telemetry: create recorder and start the run
+        # ------------------------------------------------------------------
+        run_id = self._start_time.strftime("%Y%m%dT%H%M%S") + f"_{id(self):x}"
+        if self.config.enable_telemetry:
+            self._telemetry = TelemetryRecorder(base_dir=self.config.telemetry_dir)
+            self._telemetry.start_run(
+                run_id=run_id,
+                prompt=user_prompt,
+                config=self.config.to_dict(),
+            )
+        else:
+            self._telemetry = None
+
         self.god = GroundedObjectivesDocument()
         self.god.intent.raw_prompt = user_prompt
         self.god.lock_field("intent.raw_prompt", "orchestrator")
@@ -504,6 +503,13 @@ class Orchestrator:
             "prompt_length": len(user_prompt),
             "registered_skills": len(self.registry)
         })
+        if self._telemetry:
+            self._telemetry.record_orchestrator_event(
+                event_type="PIPELINE_STARTED",
+                iteration=0,
+                data={"run_id": run_id, "prompt_length": len(user_prompt),
+                      "registered_skills": len(self.registry)},
+            )
         self._transition_to(OrchestratorState.PLANNING, "initialization complete")
 
         while self._iteration < self.config.max_total_iterations:
@@ -552,16 +558,10 @@ class Orchestrator:
                 break
 
             if result.success:
-                # Reset the consecutive-failure counter for this skill on success.
                 self._consecutive_failures[skill.metadata.name] = 0
                 for change in result.changes_made:
                     self._logger.info(f"  v {change}")
             else:
-                # BUG 1 + 2 FIX: Track consecutive failures per skill.
-                # If a skill fails (including timeout) too many times in a row,
-                # fail the pipeline immediately.  This prevents a timed-out
-                # planner from being "skipped" by _determine_target_state()
-                # advancing to ENGINEERING with an empty intent.
                 self._consecutive_failures[skill.metadata.name] += 1
                 consec = self._consecutive_failures[skill.metadata.name]
                 for error in result.errors:
@@ -577,21 +577,33 @@ class Orchestrator:
                         f"{skill.metadata.name} exceeded max consecutive failures"
                     )
                     break
-                # Do NOT advance state on failure — loop back and let
-                # _determine_target_state() re-evaluate.  The same skill
-                # will trigger again on the next iteration because GOD has
-                # not changed (intent is still empty / template still empty).
                 self._logger.info(
                     f"  Skill failed (attempt {consec}/{self.config.max_skill_retries}), "
                     "retrying same phase next iteration."
                 )
 
         self._end_time = datetime.now()
+        duration_ms = (self._end_time - self._start_time).total_seconds() * 1000
         self.events.emit(OrchestratorEventType.PIPELINE_COMPLETED, {
             "final_state": self.state.name,
             "iterations": self._iteration,
-            "duration_ms": (self._end_time - self._start_time).total_seconds() * 1000
+            "duration_ms": duration_ms,
         })
+        if self._telemetry:
+            self._telemetry.record_orchestrator_event(
+                event_type="PIPELINE_COMPLETED",
+                iteration=self._iteration,
+                data={"final_state": self.state.name, "iterations": self._iteration,
+                      "duration_ms": duration_ms},
+            )
+            self._telemetry.finish_run(
+                final_state=self.state.name,
+                iterations=self._iteration,
+                duration_ms=duration_ms,
+                remediation_rounds=self.god.get_remediation_round(),
+                validation_summary=self.god.get_validation_summary(),
+            )
+
         return self._build_result()
 
     def _log_iteration_status(self):
@@ -676,52 +688,11 @@ class Orchestrator:
             for finding in result["blocking_findings"][:5]:
                 print(f"  [{finding['severity']}] {finding['rule_id']}: {finding['message']}")
         if result["success"] and result["template"]:
-            print("\nGenerated Template:")
+            print("\nGenerated Template (first 20 lines):")
             print("-" * 50)
             lines = result["template"].split("\n")
-            for line in lines[:50]:
+            for line in lines[:20]:
                 print(line)
-            if len(lines) > 50:
-                print(f"... ({len(lines) - 50} more lines)")
+            if len(lines) > 20:
+                print(f"... ({len(lines) - 20} more lines)")
         print("\n" + "=" * 70)
-
-
-# =============================================================================
-# SKILL FACTORY
-# =============================================================================
-
-def create_default_skills() -> list[Skill]:
-    return [
-        PlannerSkill(),
-        GeneralEngineerSkill(),
-        YAMLSyntaxValidatorSkill(),
-        CFNLintValidatorSkill(),
-        CheckovValidatorSkill(),
-        IntentAlignmentValidatorSkill(),
-        RemediationSkill(),
-    ]
-
-
-def create_orchestrator(
-    llm_client=None,
-    max_remediation_rounds: int = 5,
-    max_total_iterations: int = 50,
-    max_skill_retries: int = 2,
-    skill_timeout_seconds: int = 120,
-    verbose_logging: bool = True,
-) -> Orchestrator:
-    """
-    Factory function: create a fully-configured Orchestrator with default skills.
-    """
-    config = OrchestratorConfig(
-        llm_client=llm_client,
-        max_remediation_rounds=max_remediation_rounds,
-        max_total_iterations=max_total_iterations,
-        max_skill_retries=max_skill_retries,
-        skill_timeout_seconds=skill_timeout_seconds,
-        verbose_logging=verbose_logging,
-    )
-    return (
-        Orchestrator(config)
-        .with_skills(create_default_skills())
-    )

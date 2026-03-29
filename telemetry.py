@@ -1,35 +1,30 @@
 """
-INFRA-SKILL Telemetry
-=====================
+telemetry.py  —  InfraSkill run-level telemetry recorder
+=========================================================
 
-IaCGen-style data collection. Every LLM call, skill invocation, tool use,
-error, validation result, remediation round, and the final template + GOD
-are written to a newline-delimited JSON (JSONL) file under data/.
+Writes five files per pipeline run into  ./telemetry/<run_id>/:
 
-One file per pipeline run, named by the run_id (timestamp + prompt hash).
-Each line is a self-contained JSON record with a ``record_type`` discriminator.
+  llm_conversations.jsonl   — every LLM call (prompt, response, timing)
+  god_changes.jsonl         — every mutation to the GOD (field, before, after)
+  skill_executions.jsonl    — per-skill timing, inputs, outputs, errors
+  orchestrator_events.jsonl — every orchestrator state-machine event
+  run_summary.csv           — one row per run (append mode)
 
-Record types
-------------
-``run_start``        – pipeline initialised
-``llm_call``         – every LLM request/response (all skills + skill-selector)
-``skill_start``      – skill about to execute
-``skill_end``        – skill finished (success or failure)
-``tool_use``         – deterministic tool/patch applied inside a skill
-``error``            – any caught exception or LLM-parse failure
-``validation_result``– result of each validator
-``remediation``      – one remediation round summary
-``god_snapshot``     – full GOD state (saved at key checkpoints)
-``template_snapshot``– the assembled CloudFormation template body
-``run_end``          – final result summary
+Usage (inside orchestrator.run):
+
+    from telemetry import TelemetryRecorder
+    tel = TelemetryRecorder(base_dir="telemetry")
+    tel.start_run(run_id, prompt, config_dict)
+    ...  # pass `tel` into SkillContext via context.config["telemetry"]
+    tel.finish_run(final_state, iterations, duration_ms, validation_summary)
 """
 
 from __future__ import annotations
 
-import hashlib
+import csv
 import json
 import os
-import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -43,281 +38,298 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _run_id(prompt: str) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    ph = hashlib.sha256(prompt.encode()).hexdigest()[:8]
-    return f"{ts}_{ph}"
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: 1 token ≈ 4 characters."""
+    return max(1, len(text) // 4)
+
+
+def _safe_truncate(value: Any, max_chars: int = 8000) -> Any:
+    """Truncate long strings so JSONL rows stay manageable."""
+    if isinstance(value, str) and len(value) > max_chars:
+        return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
+    return value
 
 
 # ---------------------------------------------------------------------------
-# TelemetryCollector
+# TelemetryRecorder
 # ---------------------------------------------------------------------------
 
-class TelemetryCollector:
+class TelemetryRecorder:
     """
-    Thread-safe, append-only telemetry sink.
+    Central recorder.  One instance per pipeline run.
 
-    Usage
-    -----
-    >>> tc = TelemetryCollector(run_id="...", data_dir="data")
-    >>> tc.record_run_start(prompt="...")
-    >>> tc.record_llm_call(skill_name="planner", ...)
-    >>> tc.record_skill_end(skill_name="planner", ...)
-    >>> tc.record_run_end(result_dict)
+    All public methods are safe to call from multiple threads; each write
+    is a single os.write() call on a line-buffered file, which is atomic
+    on POSIX for lines < PIPE_BUF (~4 KB).  For longer payloads we acquire
+    a simple file lock via a threading.Lock.
     """
 
-    def __init__(self, run_id: str, data_dir: str = "data"):
-        self.run_id = run_id
-        self._dir = Path(data_dir)
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._path = self._dir / f"{run_id}.jsonl"
+    # CSV columns written to run_summary.csv
+    _SUMMARY_COLS = [
+        "run_id", "started_at", "finished_at", "prompt_snippet",
+        "final_state", "iterations", "duration_ms", "remediation_rounds",
+        "llm_calls", "total_prompt_tokens", "total_response_tokens",
+        "yaml_syntax", "cfn_lint", "checkov", "intent_alignment",
+    ]
+
+    def __init__(self, base_dir: str = "telemetry"):
+        self._base_dir = Path(base_dir)
+        self._run_id: Optional[str] = None
+        self._run_dir: Optional[Path] = None
+        self._started_at: Optional[str] = None
+        self._prompt: str = ""
+        self._config: dict = {}
+        # Counters accumulated during the run
+        self._llm_call_count: int = 0
+        self._total_prompt_tokens: int = 0
+        self._total_response_tokens: int = 0
+        # File handles (opened in start_run)
+        self._fh: dict[str, Any] = {}
+        import threading
         self._lock = threading.Lock()
-        self._seq = 0
 
     # ------------------------------------------------------------------
-    # Internal
+    # Lifecycle
     # ------------------------------------------------------------------
 
-    def _write(self, record: dict) -> None:
-        with self._lock:
-            self._seq += 1
-            record["_run_id"] = self.run_id
-            record["_seq"] = self._seq
-            record["_ts"] = _now_iso()
-            with self._path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, default=str) + "\n")
+    def start_run(self, run_id: str, prompt: str, config: dict) -> None:
+        """Open output files and write the run header."""
+        self._run_id = run_id
+        self._started_at = _now_iso()
+        self._prompt = prompt
+        self._config = config
+        self._llm_call_count = 0
+        self._total_prompt_tokens = 0
+        self._total_response_tokens = 0
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self._run_dir = self._base_dir / run_id
+        self._run_dir.mkdir(parents=True, exist_ok=True)
 
-    def record_run_start(self, prompt: str, config: dict | None = None) -> None:
-        self._write({
-            "record_type": "run_start",
-            "prompt": prompt,
-            "prompt_length": len(prompt),
-            "config": config or {},
-        })
+        for name in ("llm_conversations", "god_changes", "skill_executions", "orchestrator_events"):
+            path = self._run_dir / f"{name}.jsonl"
+            self._fh[name] = open(path, "a", encoding="utf-8", buffering=1)  # line-buffered
 
-    def record_llm_call(
+        # Write a run-start marker to each stream
+        header = {"event": "run_start", "run_id": run_id, "timestamp": self._started_at,
+                  "prompt_snippet": prompt[:200], "config": config}
+        for name in self._fh:
+            self._write_jsonl(name, header)
+
+    def finish_run(
         self,
-        *,
-        skill_name: str,
-        purpose: str,          # e.g. "skill_selection", "planning", "engineering", "remediation"
-        model: str,
-        system_prompt: str,
-        user_prompt: str,
-        response: str,
-        temperature: float,
-        latency_ms: float,
-        prompt_tokens: Optional[int] = None,
-        completion_tokens: Optional[int] = None,
-        error: Optional[str] = None,
-    ) -> None:
-        self._write({
-            "record_type": "llm_call",
-            "skill_name": skill_name,
-            "purpose": purpose,
-            "model": model,
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "response": response,
-            "temperature": temperature,
-            "latency_ms": latency_ms,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "error": error,
-        })
-
-    def record_skill_start(
-        self,
-        *,
-        skill_name: str,
-        phase: str,
-        iteration: int,
-        orchestrator_state: str,
-    ) -> None:
-        self._write({
-            "record_type": "skill_start",
-            "skill_name": skill_name,
-            "phase": phase,
-            "iteration": iteration,
-            "orchestrator_state": orchestrator_state,
-        })
-
-    def record_skill_end(
-        self,
-        *,
-        skill_name: str,
-        phase: str,
-        success: bool,
-        duration_ms: float,
-        changes_made: list[str],
-        errors: list[str],
-        warnings: list[str],
-        requires_human_review: bool = False,
-        escalation_reason: Optional[str] = None,
-    ) -> None:
-        self._write({
-            "record_type": "skill_end",
-            "skill_name": skill_name,
-            "phase": phase,
-            "success": success,
-            "duration_ms": duration_ms,
-            "changes_made": changes_made,
-            "errors": errors,
-            "warnings": warnings,
-            "requires_human_review": requires_human_review,
-            "escalation_reason": escalation_reason,
-        })
-
-    def record_tool_use(
-        self,
-        *,
-        skill_name: str,
-        tool_name: str,           # e.g. "cfn_lint", "checkov", "yaml_safe_load"
-        input_summary: str,
-        output_summary: str,
-        success: bool,
-        duration_ms: float = 0.0,
-        error: Optional[str] = None,
-    ) -> None:
-        self._write({
-            "record_type": "tool_use",
-            "skill_name": skill_name,
-            "tool_name": tool_name,
-            "input_summary": input_summary,
-            "output_summary": output_summary,
-            "success": success,
-            "duration_ms": duration_ms,
-            "error": error,
-        })
-
-    def record_error(
-        self,
-        *,
-        skill_name: str,
-        error_type: str,
-        message: str,
-        traceback: Optional[str] = None,
-        context: Optional[dict] = None,
-    ) -> None:
-        self._write({
-            "record_type": "error",
-            "skill_name": skill_name,
-            "error_type": error_type,
-            "message": message,
-            "traceback": traceback,
-            "context": context or {},
-        })
-
-    def record_validation_result(
-        self,
-        *,
-        validator_name: str,
-        status: str,
-        findings: list[dict],
-        duration_ms: float,
-        raw_output: str = "",
-        tool_version: str = "",
-    ) -> None:
-        self._write({
-            "record_type": "validation_result",
-            "validator_name": validator_name,
-            "status": status,
-            "findings": findings,
-            "findings_count": len(findings),
-            "duration_ms": duration_ms,
-            "raw_output": raw_output[:4000],  # cap raw output
-            "tool_version": tool_version,
-        })
-
-    def record_remediation(
-        self,
-        *,
-        round_num: int,
-        skill_name: str,
-        findings_count: int,
-        findings_addressed: list[str],
-        fixes_applied: list[str],
-        llm_used: bool,
-        success: bool,
-        escalated: bool = False,
-        escalation_reason: Optional[str] = None,
-    ) -> None:
-        self._write({
-            "record_type": "remediation",
-            "round_num": round_num,
-            "skill_name": skill_name,
-            "findings_count": findings_count,
-            "findings_addressed": findings_addressed,
-            "fixes_applied": fixes_applied,
-            "llm_used": llm_used,
-            "success": success,
-            "escalated": escalated,
-            "escalation_reason": escalation_reason,
-        })
-
-    def record_god_snapshot(
-        self,
-        *,
-        label: str,
-        snapshot: dict,
-    ) -> None:
-        self._write({
-            "record_type": "god_snapshot",
-            "label": label,
-            "snapshot": snapshot,
-        })
-
-    def record_template_snapshot(
-        self,
-        *,
-        label: str,
-        template_body: str,
-        template_version: int,
-        checksum: str,
-    ) -> None:
-        self._write({
-            "record_type": "template_snapshot",
-            "label": label,
-            "template_body": template_body,
-            "template_version": template_version,
-            "checksum": checksum,
-        })
-
-    def record_run_end(
-        self,
-        *,
-        success: bool,
         final_state: str,
         iterations: int,
         duration_ms: float,
         remediation_rounds: int,
         validation_summary: dict,
-        findings_summary: dict,
-        template_body: Optional[str],
-        god_snapshot: Optional[dict],
     ) -> None:
-        self._write({
-            "record_type": "run_end",
-            "success": success,
+        """Write run footer and append a row to run_summary.csv."""
+        finished_at = _now_iso()
+        footer = {
+            "event": "run_end",
+            "run_id": self._run_id,
+            "timestamp": finished_at,
             "final_state": final_state,
             "iterations": iterations,
             "duration_ms": duration_ms,
             "remediation_rounds": remediation_rounds,
-            "validation_summary": validation_summary,
-            "findings_summary": findings_summary,
-            "template_body": template_body,
-            "god_snapshot": god_snapshot,
+            "llm_calls": self._llm_call_count,
+            "total_prompt_tokens": self._total_prompt_tokens,
+            "total_response_tokens": self._total_response_tokens,
+        }
+        for name in self._fh:
+            self._write_jsonl(name, footer)
+            self._fh[name].close()
+        self._fh.clear()
+
+        # Append one row to the aggregate CSV (created if absent)
+        self._append_summary_csv(
+            finished_at=finished_at,
+            final_state=final_state,
+            iterations=iterations,
+            duration_ms=duration_ms,
+            remediation_rounds=remediation_rounds,
+            validation_summary=validation_summary,
+        )
+
+    # ------------------------------------------------------------------
+    # LLM conversation recorder
+    # ------------------------------------------------------------------
+
+    def record_llm_call(
+        self,
+        *,
+        skill_name: str,
+        iteration: int,
+        call_purpose: str,          # e.g. "plan", "engineer", "remediate", "retry"
+        system_prompt: str,
+        user_message: str,
+        raw_response: str,
+        duration_ms: float,
+        success: bool,
+        error: Optional[str] = None,
+        extra: Optional[dict] = None,
+    ) -> None:
+        prompt_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_message)
+        response_tokens = _estimate_tokens(raw_response) if raw_response else 0
+        self._llm_call_count += 1
+        self._total_prompt_tokens += prompt_tokens
+        self._total_response_tokens += response_tokens
+
+        record = {
+            "event": "llm_call",
+            "run_id": self._run_id,
+            "timestamp": _now_iso(),
+            "skill_name": skill_name,
+            "iteration": iteration,
+            "call_purpose": call_purpose,
+            "success": success,
+            "duration_ms": round(duration_ms, 2),
+            "prompt_tokens_est": prompt_tokens,
+            "response_tokens_est": response_tokens,
+            "system_prompt": _safe_truncate(system_prompt, 4000),
+            "user_message": _safe_truncate(user_message, 4000),
+            "raw_response": _safe_truncate(raw_response, 8000),
+            "error": error,
+        }
+        if extra:
+            record.update(extra)
+        self._write_jsonl("llm_conversations", record)
+
+    # ------------------------------------------------------------------
+    # GOD change recorder
+    # ------------------------------------------------------------------
+
+    def record_god_change(
+        self,
+        *,
+        field: str,
+        before: Any,
+        after: Any,
+        changed_by: str,
+        iteration: int,
+    ) -> None:
+        def _repr(v: Any) -> Any:
+            s = str(v)
+            return _safe_truncate(s, 2000)
+
+        self._write_jsonl("god_changes", {
+            "event": "god_change",
+            "run_id": self._run_id,
+            "timestamp": _now_iso(),
+            "iteration": iteration,
+            "changed_by": changed_by,
+            "field": field,
+            "before": _repr(before),
+            "after": _repr(after),
+            "before_len": len(str(before)) if before is not None else 0,
+            "after_len": len(str(after)) if after is not None else 0,
         })
 
+    # ------------------------------------------------------------------
+    # Skill execution recorder
+    # ------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Factory helper
-# ---------------------------------------------------------------------------
+    def record_skill_execution(
+        self,
+        *,
+        skill_name: str,
+        phase: str,
+        iteration: int,
+        success: bool,
+        duration_ms: float,
+        changes_made: list[str],
+        errors: list[str],
+        warnings: list[str],
+        inputs: Optional[dict] = None,
+        outputs: Optional[dict] = None,
+    ) -> None:
+        self._write_jsonl("skill_executions", {
+            "event": "skill_execution",
+            "run_id": self._run_id,
+            "timestamp": _now_iso(),
+            "skill_name": skill_name,
+            "phase": phase,
+            "iteration": iteration,
+            "success": success,
+            "duration_ms": round(duration_ms, 2),
+            "changes_made": changes_made,
+            "errors": errors,
+            "warnings": warnings,
+            "inputs": {k: _safe_truncate(v) for k, v in (inputs or {}).items()},
+            "outputs": {k: _safe_truncate(v) for k, v in (outputs or {}).items()},
+        })
 
-def make_collector(prompt: str, data_dir: str = "data") -> TelemetryCollector:
-    """Create a TelemetryCollector for a new pipeline run."""
-    rid = _run_id(prompt)
-    return TelemetryCollector(run_id=rid, data_dir=data_dir)
+    # ------------------------------------------------------------------
+    # Orchestrator event recorder
+    # ------------------------------------------------------------------
+
+    def record_orchestrator_event(
+        self,
+        *,
+        event_type: str,
+        iteration: int,
+        data: dict,
+    ) -> None:
+        self._write_jsonl("orchestrator_events", {
+            "event": "orchestrator_event",
+            "run_id": self._run_id,
+            "timestamp": _now_iso(),
+            "iteration": iteration,
+            "event_type": event_type,
+            "data": data,
+        })
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _write_jsonl(self, stream: str, record: dict) -> None:
+        fh = self._fh.get(stream)
+        if fh is None:
+            return
+        line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+        with self._lock:
+            fh.write(line)
+
+    def _append_summary_csv(self, *, finished_at, final_state, iterations,
+                             duration_ms, remediation_rounds, validation_summary) -> None:
+        csv_path = self._base_dir / "run_summary.csv"
+        write_header = not csv_path.exists()
+        with open(csv_path, "a", newline="", encoding="utf-8") as fcsv:
+            writer = csv.DictWriter(fcsv, fieldnames=self._SUMMARY_COLS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                "run_id": self._run_id,
+                "started_at": self._started_at,
+                "finished_at": finished_at,
+                "prompt_snippet": self._prompt[:120].replace("\n", " "),
+                "final_state": final_state,
+                "iterations": iterations,
+                "duration_ms": round(duration_ms, 1),
+                "remediation_rounds": remediation_rounds,
+                "llm_calls": self._llm_call_count,
+                "total_prompt_tokens": self._total_prompt_tokens,
+                "total_response_tokens": self._total_response_tokens,
+                "yaml_syntax": validation_summary.get("yaml_syntax", "N/A"),
+                "cfn_lint": validation_summary.get("cfn_lint", "N/A"),
+                "checkov": validation_summary.get("checkov", "N/A"),
+                "intent_alignment": validation_summary.get("intent_alignment", "N/A"),
+            })
+
+    # ------------------------------------------------------------------
+    # Convenience: context manager
+    # ------------------------------------------------------------------
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        # Close any open handles if finish_run was not called
+        for fh in self._fh.values():
+            try:
+                fh.close()
+            except Exception:
+                pass
+        self._fh.clear()

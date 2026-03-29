@@ -1,18 +1,10 @@
 # -----------------------------------------------------------------------------
-# PLANNING SKILL  v3.0.0  — pure LLM, no regex fallback
-# -----------------------------------------------------------------------------
-#
-# The planner is a pure LLM skill. It sends the user's natural-language prompt
-# to the LLM with a structured JSON schema and populates the GOD intent.
-#
-# If no LLM client is configured the skill fails immediately with a clear error
-# rather than silently producing a regex-inferred plan.
-#
-# JSON parse failure: one correction retry is attempted before giving up.
+# PLANNING SKILL  v3.1.0  — pure LLM + telemetry instrumentation
 # -----------------------------------------------------------------------------
 
 from datetime import datetime
 import json
+import time
 from typing import Optional
 
 from enums import SkillPhase
@@ -20,21 +12,19 @@ from god import AcceptanceCriterion, Constraints, ExtractedResource, GroundedObj
 from llm_client import OpenRouterClient
 from prompt import PLANNER_SYSTEM_PROMPT
 from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
+from telemetry import TelemetryRecorder
 
 
 class PlannerSkill(Skill):
     """
     Transforms a natural-language infrastructure prompt into a machine-checkable
     GOD specification: resource list, constraints, and acceptance criteria.
-
-    This skill is a pure LLM agent — it has no deterministic fallback.
-    A configured LLM client is required for execution.
     """
 
     def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
             name="planner",
-            version="3.0.0",
+            version="3.1.0",
             description=(
                 "Transforms a natural-language infrastructure prompt into a "
                 "machine-checkable GOD specification: resource list, constraints, "
@@ -72,6 +62,8 @@ class PlannerSkill(Skill):
         god = context.god
         result = SkillResult(success=True, skill_name=self.metadata.name)
         llm: Optional[OpenRouterClient] = context.get_config("llm")
+        tel: Optional[TelemetryRecorder] = context.get_config("telemetry")
+        iteration: int = context.iteration
 
         if llm is None:
             return SkillResult.failure(
@@ -80,8 +72,6 @@ class PlannerSkill(Skill):
                 "resources and acceptance criteria from the prompt.",
             )
 
-        # Append any accumulated remediation hints as additional context
-        # so the planner incorporates corrections from previous rounds.
         remediation_hints = getattr(god.template, "remediation_hints", "") or ""
         user_message = god.intent.raw_prompt
         if remediation_hints:
@@ -91,13 +81,48 @@ class PlannerSkill(Skill):
                 f"{remediation_hints}"
             )
 
-        raw = llm.complete(
-            system=PLANNER_SYSTEM_PROMPT,
-            user=user_message,
-            temperature=0.0,
-        )
+        # Record GOD reads
+        if tel:
+            tel.record_god_change(
+                field="intent.raw_prompt",
+                before=None,
+                after=god.intent.raw_prompt,
+                changed_by=self.metadata.name,
+                iteration=iteration,
+            )
 
-        data = self._parse_json_with_retry(raw, user_message, llm)
+        t0 = time.monotonic()
+        try:
+            raw = llm.complete(
+                system=PLANNER_SYSTEM_PROMPT,
+                user=user_message,
+                temperature=0.0,
+            )
+            llm_ok = True
+            llm_err = None
+        except Exception as e:
+            raw = ""
+            llm_ok = False
+            llm_err = str(e)
+        llm_ms = (time.monotonic() - t0) * 1000
+
+        if tel:
+            tel.record_llm_call(
+                skill_name=self.metadata.name,
+                iteration=iteration,
+                call_purpose="plan",
+                system_prompt=PLANNER_SYSTEM_PROMPT,
+                user_message=user_message,
+                raw_response=raw,
+                duration_ms=llm_ms,
+                success=llm_ok,
+                error=llm_err,
+            )
+
+        if not llm_ok:
+            return SkillResult.failure(self.metadata.name, f"LLM call failed: {llm_err}")
+
+        data = self._parse_json_with_retry(raw, user_message, llm, tel, iteration)
         if data is None:
             return SkillResult.failure(
                 self.metadata.name,
@@ -105,6 +130,7 @@ class PlannerSkill(Skill):
                 "Check model availability or prompt.",
             )
 
+        before_resources = list(god.intent.resources) if god.intent.resources else []
         god.intent.resources = [ExtractedResource(**r) for r in data["resources"]]
         god.intent.constraints = Constraints(**data["constraints"])
         god.intent.acceptance_criteria = [
@@ -113,6 +139,29 @@ class PlannerSkill(Skill):
         god.intent.normalized_prompt = god.intent.raw_prompt.lower()
         god.intent.parsed_at = datetime.now().isoformat()
         god.intent.parser_version = self.metadata.version
+
+        if tel:
+            tel.record_god_change(
+                field="intent.resources",
+                before=before_resources,
+                after=[r.resource_type for r in god.intent.resources],
+                changed_by=self.metadata.name,
+                iteration=iteration,
+            )
+            tel.record_god_change(
+                field="intent.constraints",
+                before=None,
+                after=str(god.intent.constraints),
+                changed_by=self.metadata.name,
+                iteration=iteration,
+            )
+            tel.record_god_change(
+                field="intent.acceptance_criteria",
+                before=[],
+                after=[str(c) for c in god.intent.acceptance_criteria],
+                changed_by=self.metadata.name,
+                iteration=iteration,
+            )
 
         result.changes_made.append(
             f"LLM extracted {len(god.intent.resources)} resources, "
@@ -128,8 +177,9 @@ class PlannerSkill(Skill):
         raw: str,
         original_message: str,
         llm: OpenRouterClient,
+        tel: Optional[TelemetryRecorder],
+        iteration: int,
     ) -> Optional[dict]:
-        """Parse JSON from LLM output; on failure ask the LLM to correct it once."""
         cleaned = self._strip_fences(raw)
         try:
             return json.loads(cleaned)
@@ -138,33 +188,58 @@ class PlannerSkill(Skill):
                 f"LLM returned invalid JSON ({exc}); retrying with correction prompt."
             )
 
+        correction_system = (
+            "Your previous response was not valid JSON. "
+            "Return ONLY a valid JSON object — no markdown, no prose, no code fences. "
+            "The JSON must match the schema in the original system prompt."
+        )
+        correction_user = (
+            f"Original request:\n{original_message}\n\n"
+            f"Your previous (invalid) response:\n{raw[:2000]}\n\n"
+            "Please return ONLY the corrected JSON object."
+        )
+        t0 = time.monotonic()
         try:
             corrected = llm.complete(
-                system=(
-                    "Your previous response was not valid JSON. "
-                    "Return ONLY a valid JSON object — no markdown, no prose, no code fences. "
-                    "The JSON must match the schema in the original system prompt."
-                ),
-                user=(
-                    f"Original request:\n{original_message}\n\n"
-                    f"Your previous (invalid) response:\n{raw[:2000]}\n\n"
-                    "Please return ONLY the corrected JSON object."
-                ),
+                system=correction_system,
+                user=correction_user,
                 temperature=0.0,
             )
+            retry_ok = True
+            retry_err = None
+        except Exception as exc2:
+            corrected = ""
+            retry_ok = False
+            retry_err = str(exc2)
+        retry_ms = (time.monotonic() - t0) * 1000
+
+        if tel:
+            tel.record_llm_call(
+                skill_name=self.metadata.name,
+                iteration=iteration,
+                call_purpose="plan_json_retry",
+                system_prompt=correction_system,
+                user_message=correction_user,
+                raw_response=corrected,
+                duration_ms=retry_ms,
+                success=retry_ok,
+                error=retry_err,
+            )
+
+        if not retry_ok:
+            self._logger.error(f"LLM correction retry failed: {retry_err}")
+            return None
+
+        try:
             return json.loads(self._strip_fences(corrected))
         except json.JSONDecodeError as exc2:
             self._logger.error(
                 f"LLM correction retry also returned invalid JSON ({exc2}). Giving up."
             )
             return None
-        except Exception as exc2:
-            self._logger.error(f"LLM correction retry failed: {exc2}")
-            return None
 
     @staticmethod
     def _strip_fences(text: str) -> str:
-        """Remove optional markdown code fences from an LLM response."""
         lines = text.strip().splitlines()
         if lines and lines[0].startswith("```"):
             lines = lines[1:]
