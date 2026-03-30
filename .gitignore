@@ -1,4 +1,5 @@
 .env
 **/benchmark_results/**
+**/telemetry/**
 **/**/__pycache__/**
 **/venv/**

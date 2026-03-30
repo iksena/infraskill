@@ -20,15 +20,12 @@
 # -----------------------------------------------------------------------------
 
 from datetime import datetime
-import json
 import os
 import shutil
-import subprocess
 import tempfile
-from typing import Any
 
 from enums import Severity, SkillPhase, ValidationStatus
-from god import AcceptanceCriterion, GroundedObjectivesDocument, ValidationFinding, ValidationResult
+from god import GroundedObjectivesDocument, ValidationFinding, ValidationResult
 from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
 
 

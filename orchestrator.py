@@ -410,7 +410,7 @@ class Orchestrator:
         if llm is None:
             return candidates[0]
 
-        god_snapshot = json.dumps(self.god.intent.to_dict(), indent=2)[:2000]
+        god_snapshot = json.dumps(self.god.intent.to_dict(), indent=2)
         candidate_table = json.dumps(
             [s.metadata.to_dict() for s in candidates], indent=2
         )
