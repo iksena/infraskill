@@ -1,5 +1,14 @@
 # -----------------------------------------------------------------------------
-# ENGINEERING SKILL  v2.1.0  — pure LLM + telemetry instrumentation
+# ENGINEERING SKILL  v2.2.0  — full GOD context in every LLM call
+# -----------------------------------------------------------------------------
+# Changes from v2.1.0:
+#   - acceptance_criteria and remediation_hints are now injected into the
+#     system prompt so the LLM has the full GOD picture on first generation
+#     and on every re-plan round.
+#   - god_snapshot is serialised as JSON and appended to the user message
+#     so the LLM can cross-reference resource types, constraints, and AC.
+#   - record_god_change now fired even when before_body is empty so the
+#     llm_conversations and god_changes logs are always in sync.
 # -----------------------------------------------------------------------------
 
 import json
@@ -26,16 +35,16 @@ class GeneralEngineerSkill(Skill):
     def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
             name="general-engineer",
-            version="2.1.0",
+            version="2.2.0",
             description=(
                 "Generates a complete AWS CloudFormation template from the GOD "
                 "specification in a single LLM call."
             ),
             llm_description=(
                 "Given a full infrastructure specification (resources, constraints, "
-                "remediation hints), produce a complete, deployment-ready "
-                "CloudFormation YAML template. All resources, parameters, outputs, "
-                "and cross-resource references must be included."
+                "acceptance criteria, remediation hints), produce a complete, "
+                "deployment-ready CloudFormation YAML template. All resources, "
+                "parameters, outputs, and cross-resource references must be included."
             ),
             phase=SkillPhase.ENGINEERING,
             trigger_condition=(
@@ -45,6 +54,7 @@ class GeneralEngineerSkill(Skill):
             reads_from=[
                 "intent.resources",
                 "intent.constraints",
+                "intent.acceptance_criteria",
                 "template.remediation_hints",
             ],
             priority=10,
@@ -78,6 +88,9 @@ class GeneralEngineerSkill(Skill):
                 "No LLM client configured — cannot generate CloudFormation template.",
             )
 
+        # ------------------------------------------------------------------
+        # Build prompt context from the full GOD
+        # ------------------------------------------------------------------
         resources_spec = json.dumps(
             [
                 {
@@ -110,14 +123,28 @@ class GeneralEngineerSkill(Skill):
             indent=2,
         )
 
+        acceptance_criteria = json.dumps(
+            [ac.to_dict() for ac in god.intent.acceptance_criteria],
+            indent=2,
+        ) if god.intent.acceptance_criteria else "(none defined)"
+
         remediation_hints = getattr(god.template, "remediation_hints", "") or "(none)"
 
         system = ENGINEER_SYSTEM_PROMPT.format(
             resources_spec=resources_spec,
             constraints_spec=constraints_spec,
+            acceptance_criteria=acceptance_criteria,
             remediation_hints=remediation_hints,
         )
-        user_message = "Generate the complete CloudFormation template."
+
+        # Attach a compact GOD snapshot as additional user-turn context so the
+        # LLM can see resource counts, validation state, and prior round info.
+        god_snapshot_json = json.dumps(god.snapshot(), indent=2, default=str)
+        user_message = (
+            "Generate the complete CloudFormation template.\n\n"
+            "## Full GOD snapshot (for reference)\n"
+            f"```json\n{god_snapshot_json}\n```"
+        )
 
         t0 = time.monotonic()
         try:
@@ -145,7 +172,13 @@ class GeneralEngineerSkill(Skill):
                 duration_ms=llm_ms,
                 success=llm_ok,
                 error=llm_err,
-                extra={"resource_count": len(god.intent.resources)},
+                extra={
+                    "resource_count": len(god.intent.resources),
+                    "ac_count": len(god.intent.acceptance_criteria),
+                    "has_remediation_hints": bool(
+                        getattr(god.template, "remediation_hints", "")
+                    ),
+                },
             )
 
         if not llm_ok:
@@ -163,7 +196,7 @@ class GeneralEngineerSkill(Skill):
                 "(missing AWSTemplateFormatVersion). Raw output logged at DEBUG.",
             )
 
-        before_body = god.template.body
+        before_body = god.template.body  # empty string on first run
         god.template.body = template_body
         god.template.resources = {}
         god.template.update_checksum()

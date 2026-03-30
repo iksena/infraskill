@@ -80,6 +80,7 @@ CloudFormation template in YAML that satisfies the infrastructure specification 
 - Follow AWS security best practices: least-privilege IAM, restricted ingress unless \
 public_access_allowed is true, encryption enabled where supported, deletion protection on \
 stateful resources in production.
+- Satisfy EVERY acceptance criterion listed below -- each one is a mandatory property check.
 
 ## Output rules
 
@@ -91,11 +92,17 @@ stateful resources in production.
 
 ## Specification
 
-Resources to generate:
+### Resources to generate
 {resources_spec}
 
-Constraints:
+### Constraints
 {constraints_spec}
+
+### Acceptance criteria (MUST ALL PASS)
+{acceptance_criteria}
+
+### Remediation hints from previous rounds (apply if non-empty)
+{remediation_hints}
 """
 
 
@@ -105,15 +112,22 @@ CloudFormation template that has failed validation.
 
 ## Your responsibilities
 
-- Analyse all provided validation findings carefully.
+- Analyse ALL provided validation findings carefully.
 - Produce a COMPLETE, corrected CloudFormation template that resolves every finding.
-- Preserve ALL resources and their intended behaviour -- do not remove resources.
+- Preserve ALL resources and their intended behaviour -- do not remove any resource.
 - Do not introduce new issues while fixing existing ones.
+- Satisfy every acceptance criterion listed in the GOD snapshot below.
 
 ## Output rules
 
 - Output ONLY the complete fixed YAML template. Start with AWSTemplateFormatVersion.
 - No markdown fences, no prose, no explanations.
+- CRITICAL: Your output MUST differ from the current template. If you cannot fix a finding,
+  add a YAML comment on the offending resource explaining why. Do not return the template
+  unchanged.
+
+## Current GOD snapshot
+{god_snapshot}
 """
 
 

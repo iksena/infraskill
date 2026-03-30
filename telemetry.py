@@ -161,7 +161,7 @@ class TelemetryRecorder:
         *,
         skill_name: str,
         iteration: int,
-        call_purpose: str,          # e.g. "plan", "engineer", "remediate", "retry"
+        call_purpose: str,
         system_prompt: str,
         user_message: str,
         raw_response: str,
@@ -170,6 +170,23 @@ class TelemetryRecorder:
         error: Optional[str] = None,
         extra: Optional[dict] = None,
     ) -> None:
+        """
+        Record a full LLM conversation turn to llm_conversations.jsonl.
+
+        Stores the complete system prompt, user message, and raw LLM
+        completion (each truncated to 8 000 chars to keep rows manageable
+        while still capturing the full context window shape).
+
+        Fields:
+          system_prompt      — the rendered system prompt sent to the LLM
+          user_message       — the user-turn message (includes GOD snapshot
+                               for engineer and remediation skills)
+          raw_response       — the raw completion text returned by the LLM
+          completion_ok      — True when the LLM returned a non-empty
+                               completion without raising an exception
+          prompt_tokens_est  — rough token count for prompt (len // 4)
+          response_tokens_est— rough token count for response
+        """
         prompt_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_message)
         response_tokens = _estimate_tokens(raw_response) if raw_response else 0
         self._llm_call_count += 1
@@ -183,12 +200,15 @@ class TelemetryRecorder:
             "skill_name": skill_name,
             "iteration": iteration,
             "call_purpose": call_purpose,
+            # completion result
+            "completion_ok": success and bool(raw_response),
             "success": success,
             "duration_ms": round(duration_ms, 2),
             "prompt_tokens_est": prompt_tokens,
             "response_tokens_est": response_tokens,
-            "system_prompt": _safe_truncate(system_prompt, 4000),
-            "user_message": _safe_truncate(user_message, 4000),
+            # full conversation — truncated to stay under JSONL row limits
+            "system_prompt": _safe_truncate(system_prompt, 8000),
+            "user_message": _safe_truncate(user_message, 8000),
             "raw_response": _safe_truncate(raw_response, 8000),
             "error": error,
         }
@@ -208,10 +228,27 @@ class TelemetryRecorder:
         after: Any,
         changed_by: str,
         iteration: int,
+        noop: bool = False,
     ) -> None:
-        def _repr(v: Any) -> Any:
-            s = str(v)
-            return _safe_truncate(s, 2000)
+        """
+        Record a GOD field mutation to god_changes.jsonl.
+
+        before_len / after_len are computed on the raw string representation
+        BEFORE any truncation so they accurately reflect whether the field
+        actually changed (identical lengths on identical content = no-op).
+
+        The `noop` flag is set to True by RemediationSkill when the LLM
+        returned an unchanged template, making no-op rounds immediately
+        visible when grepping god_changes.jsonl.
+
+        The `changed` boolean is True whenever before != after (by value),
+        regardless of length equality.
+        """
+        before_str = str(before) if before is not None else ""
+        after_str = str(after) if after is not None else ""
+
+        def _repr(v: str) -> Any:
+            return _safe_truncate(v, 2000)
 
         self._write_jsonl("god_changes", {
             "event": "god_change",
@@ -220,10 +257,14 @@ class TelemetryRecorder:
             "iteration": iteration,
             "changed_by": changed_by,
             "field": field,
-            "before": _repr(before),
-            "after": _repr(after),
-            "before_len": len(str(before)) if before is not None else 0,
-            "after_len": len(str(after)) if after is not None else 0,
+            "before": _repr(before_str),
+            "after": _repr(after_str),
+            # lengths on the RAW strings (before truncation) for accurate diffing
+            "before_len": len(before_str),
+            "after_len": len(after_str),
+            # convenience flags
+            "changed": before_str != after_str,
+            "noop": noop,
         })
 
     # ------------------------------------------------------------------

@@ -1,10 +1,20 @@
 # -----------------------------------------------------------------------------
-# REMEDIATION SKILL  v3.3.0  -- no round cap; iteration budget controls stopping
+# REMEDIATION SKILL  v3.4.0  — full GOD context + no-op guard
 # -----------------------------------------------------------------------------
-# can_trigger() no longer checks get_remediation_round() < N.
-# The orchestrator's max_total_iterations is the sole stop condition.
+# Changes from v3.3.0:
+#   - _llm_fix injects the full GOD snapshot (json) into REMEDIATION_SYSTEM_PROMPT
+#     so the LLM can see resources, constraints, acceptance_criteria, and
+#     validation state while producing the fixed template.
+#   - All validation findings (not just blocking) are appended to the user
+#     message so the LLM can avoid introducing new issues.
+#   - No-op guard: if the LLM returns a template identical to god.template.body
+#     the skill records a failed telemetry event and returns SkillResult.failure
+#     so the orchestrator does not silently loop on unchanged templates.
+#   - record_god_change is always called (even on no-op) so god_changes.jsonl
+#     and llm_conversations.jsonl stay in sync.
 # -----------------------------------------------------------------------------
 
+import json
 import time
 from typing import Optional
 
@@ -44,9 +54,9 @@ class RemediationSkill(Skill):
                 "Any FAIL validator has blocking findings AND template.body is non-empty"
             ),
             writes_to=["template.body", "template.version", "remediation_log"],
-            reads_from=["template.body", "validation_state"],
+            reads_from=["template.body", "validation_state", "intent"],
             priority=10,
-            version="3.3.0",
+            version="3.4.0",
             tags=["llm", "remediation", "cloudformation"],
         )
 
@@ -90,10 +100,14 @@ class RemediationSkill(Skill):
         self._accumulate_hints(god, round_num, blocking_findings)
 
         if intent_findings and not fixable_findings:
-            return self._reset_for_replanning(god, skill_result, round_num, intent_findings, tel, iteration)
+            return self._reset_for_replanning(
+                god, skill_result, round_num, intent_findings, tel, iteration
+            )
 
         findings_to_fix = fixable_findings or blocking_findings
-        return self._llm_fix(god, skill_result, llm, round_num, findings_to_fix, tel, iteration)
+        return self._llm_fix(
+            god, skill_result, llm, round_num, findings_to_fix, tel, iteration
+        )
 
     # =========================================================================
     # LLM in-place fix
@@ -109,19 +123,44 @@ class RemediationSkill(Skill):
         tel: Optional[TelemetryRecorder],
         iteration: int,
     ) -> SkillResult:
+        # ------------------------------------------------------------------
+        # Build findings text (blocking) + all_findings text (full picture)
+        # ------------------------------------------------------------------
         findings_text = "\n".join(
             f"- [{f.severity.name}] {f.rule_id} on '{f.resource_name}': "
             f"{f.message}. Remediation hint: {f.remediation_hint or 'n/a'}"
             for f in findings
         )
 
+        # All findings across every validator give the LLM the full picture
+        # so it avoids introducing new issues while fixing existing ones.
+        all_findings = [
+            finding
+            for result in god.validation_state.values()
+            for finding in result.findings
+        ]
+        all_findings_text = "\n".join(
+            f"- [{f.severity.name}] {f.rule_id} on '{f.resource_name}': {f.message}"
+            for f in all_findings
+        ) or "(none)"
+
         remediation_hints = getattr(god.template, "remediation_hints", "") or "(none)"
+
+        # Full GOD snapshot so the LLM sees resources, constraints, and AC
+        god_snapshot_json = json.dumps(god.snapshot(), indent=2, default=str)
+
+        system = REMEDIATION_SYSTEM_PROMPT.format(
+            god_snapshot=god_snapshot_json,
+        )
+
         user_message = (
-            f"## Current template\n"
+            f"## Current template (round {round_num})\n"
             f"```yaml\n{god.template.body}\n```\n\n"
-            f"## Validation findings to fix (round {round_num})\n"
+            f"## Blocking findings to fix\n"
             f"{findings_text}\n\n"
-            f"## Accumulated context from previous rounds\n"
+            f"## All validation findings (context — do not introduce new ones)\n"
+            f"{all_findings_text}\n\n"
+            f"## Accumulated hints from previous rounds\n"
             f"{remediation_hints}"
         )
 
@@ -132,7 +171,7 @@ class RemediationSkill(Skill):
         t0 = time.monotonic()
         try:
             fixed_template = llm.complete(
-                system=REMEDIATION_SYSTEM_PROMPT,
+                system=system,
                 user=user_message,
                 temperature=0.0,
             )
@@ -149,7 +188,7 @@ class RemediationSkill(Skill):
                 skill_name=self.metadata.name,
                 iteration=iteration,
                 call_purpose=f"remediate_round_{round_num}",
-                system_prompt=REMEDIATION_SYSTEM_PROMPT,
+                system_prompt=system,
                 user_message=user_message,
                 raw_response=fixed_template,
                 duration_ms=llm_ms,
@@ -159,6 +198,7 @@ class RemediationSkill(Skill):
                     "round_num": round_num,
                     "finding_count": len(findings),
                     "finding_ids": [f.rule_id for f in findings],
+                    "all_finding_count": len(all_findings),
                 },
             )
 
@@ -178,6 +218,45 @@ class RemediationSkill(Skill):
             return skill_result
 
         before_body = god.template.body
+
+        # ------------------------------------------------------------------
+        # No-op guard: detect when the LLM returned the template unchanged
+        # ------------------------------------------------------------------
+        if fixed_template == before_body:
+            self._logger.warning(
+                f"  [llm-fix] No-op detected on round {round_num}: "
+                "LLM returned an identical template. Marking as failure."
+            )
+            if tel:
+                tel.record_god_change(
+                    field="template.body",
+                    before=before_body,
+                    after=fixed_template,
+                    changed_by=self.metadata.name,
+                    iteration=iteration,
+                    noop=True,
+                )
+            god.add_remediation_entry(RemediationEntry(
+                round=round_num,
+                skill_name=self.metadata.name,
+                action_type="patch",
+                target="template",
+                description=f"LLM returned unchanged template (no-op) on round {round_num}",
+                rationale=f"Findings: {[f.rule_id for f in findings]}",
+                findings_addressed=[f.rule_id for f in findings],
+                success=False,
+                strategy_type="llm_noop",
+            ))
+            skill_result.success = False
+            skill_result.errors.append(
+                f"Remediation round {round_num} produced no changes to the template. "
+                "The LLM returned an identical body. Check findings and prompt."
+            )
+            return skill_result
+
+        # ------------------------------------------------------------------
+        # Apply the fix
+        # ------------------------------------------------------------------
         god.template.body = fixed_template
         god.template.update_checksum()
         god.template.increment_version(self.metadata.name)
