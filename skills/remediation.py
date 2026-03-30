@@ -1,17 +1,12 @@
 # -----------------------------------------------------------------------------
-# REMEDIATION SKILL  v3.4.0  — full GOD context + no-op guard
+# REMEDIATION SKILL  v3.5.0  — checkov policy context injection
 # -----------------------------------------------------------------------------
-# Changes from v3.3.0:
-#   - _llm_fix injects the full GOD snapshot (json) into REMEDIATION_SYSTEM_PROMPT
-#     so the LLM can see resources, constraints, acceptance_criteria, and
-#     validation state while producing the fixed template.
-#   - All validation findings (not just blocking) are appended to the user
-#     message so the LLM can avoid introducing new issues.
-#   - No-op guard: if the LLM returns a template identical to god.template.body
-#     the skill records a failed telemetry event and returns SkillResult.failure
-#     so the orchestrator does not silently loop on unchanged templates.
-#   - record_god_change is always called (even on no-op) so god_changes.jsonl
-#     and llm_conversations.jsonl stay in sync.
+# Changes from v3.4.0:
+#   - _llm_fix now calls get_checkov_policy_context() for any CKV_* findings
+#     and appends the policy source code block to the user message.
+#     This mirrors the generate_security_remediation_feedback pattern from
+#     IaCGen (Code/main.py) so the LLM sees the exact scan_resource_conf()
+#     logic and knows precisely which CFN property path to fix.
 # -----------------------------------------------------------------------------
 
 import json
@@ -24,6 +19,7 @@ from llm_client import OpenRouterClient
 from prompt import REMEDIATION_SYSTEM_PROMPT
 from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
 from telemetry import TelemetryRecorder
+from checkov_context import get_checkov_policy_context
 
 _REPLAN_PREFIXES = ("INTENT", "COVERAGE", "AC-")
 
@@ -56,7 +52,7 @@ class RemediationSkill(Skill):
             writes_to=["template.body", "template.version", "remediation_log"],
             reads_from=["template.body", "validation_state", "intent"],
             priority=10,
-            version="3.4.0",
+            version="3.5.0",
             tags=["llm", "remediation", "cloudformation"],
         )
 
@@ -153,6 +149,24 @@ class RemediationSkill(Skill):
             god_snapshot=god_snapshot_json,
         )
 
+        # ------------------------------------------------------------------
+        # Checkov policy context — inject source code for CKV_* findings so
+        # the LLM understands exactly which CFN property path must be fixed.
+        # Mirrors generate_security_remediation_feedback from IaCGen.
+        # ------------------------------------------------------------------
+        checkov_findings = [f for f in findings if (f.rule_id or "").startswith("CKV_")]
+        policy_context_block = ""
+        if checkov_findings:
+            policy_context = get_checkov_policy_context(checkov_findings)
+            if policy_context:
+                policy_context_block = (
+                    "\n\n## Security Policy Reference\n"
+                    "The following Checkov check source code defines exactly which "
+                    "CloudFormation property path is inspected and what value makes "
+                    "each check pass. Use this to determine the precise fix:\n\n"
+                    f"{policy_context}\n"
+                )
+
         user_message = (
             f"## Current template (round {round_num})\n"
             f"```yaml\n{god.template.body}\n```\n\n"
@@ -162,10 +176,12 @@ class RemediationSkill(Skill):
             f"{all_findings_text}\n\n"
             f"## Accumulated hints from previous rounds\n"
             f"{remediation_hints}"
+            f"{policy_context_block}"
         )
 
         self._logger.info(
             f"  [llm-fix] Sending {len(findings)} findings to LLM (round {round_num})"
+            + (f", {len(checkov_findings)} with policy context" if checkov_findings else "")
         )
 
         t0 = time.monotonic()
@@ -199,6 +215,7 @@ class RemediationSkill(Skill):
                     "finding_count": len(findings),
                     "finding_ids": [f.rule_id for f in findings],
                     "all_finding_count": len(all_findings),
+                    "checkov_policy_context_count": len(checkov_findings),
                 },
             )
 
