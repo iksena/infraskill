@@ -11,8 +11,18 @@
 # Gate semantics for can_trigger()
 # ---------------------------------
 # Each validator requires its upstream predecessor to be PASS or ERROR.
-# ERROR means the tool is absent from PATH — it is treated as "skipped"
+# ERROR means the tool is absent from PATH — it is treated as “skipped”
 # so the pipeline keeps moving rather than stalling forever.
+#
+# Checkov → Remediation policy context
+# ---------------------------------------
+# CheckovValidatorSkill populates ValidationFinding.check_id for every failed
+# CKV_* check.  RemediationSkill uses checkov_context.get_checkov_policy_context()
+# to look up the Checkov source code for each failing check_id from
+# Data/checkov_cfn_policy_map.csv and appends it to the LLM fix prompt.
+# This mirrors the generate_security_remediation_feedback pattern in IaCGen
+# (Code/main.py) so the LLM sees the exact scan_resource_conf() logic and
+# knows precisely which CFN property path to fix.
 #
 # Progressive disclosure:
 #   All heavy imports (yaml, subprocess, shutil, json, re) are deferred to
@@ -34,7 +44,7 @@ _PASS_OR_ERROR = (ValidationStatus.PASS, ValidationStatus.ERROR)
 # -----------------------------------------------------------------------------
 # CloudFormation-aware YAML loader
 # -----------------------------------------------------------------------------
-# PyYAML's safe_load rejects all custom tags (e.g. !Ref, !Sub, !GetAtt).
+# PyYAML’s safe_load rejects all custom tags (e.g. !Ref, !Sub, !GetAtt).
 # CloudFormation templates use these tags extensively, so we register
 # passthrough constructors for every known CFN intrinsic function tag.
 # This approach is taken directly from the IaCGen evaluation pipeline
@@ -430,6 +440,16 @@ class CheckovValidatorSkill(Skill):
     Gate: cfn_lint must be PASS **or ERROR** (missing cfn-lint tool is treated
     as skipped — the pipeline must not stall here).
     Install: pip install checkov
+
+    Policy context integration
+    --------------------------
+    Every failed check is stored as a ValidationFinding with check_id populated.
+    RemediationSkill reads check_id and calls
+    checkov_context.get_checkov_policy_context() to look up the Checkov source
+    code from Data/checkov_cfn_policy_map.csv, then appends it to the LLM
+    remediation prompt.  No changes to this skill are required — check_id is
+    already populated by _check_to_finding() and the remediation_hint is
+    augmented below to surface the inspected CFN property path.
     """
 
     _SEVERITY_MAP: dict[str, Severity] = {
@@ -451,11 +471,14 @@ class CheckovValidatorSkill(Skill):
     def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
             name="checkov-validator",
-            version="1.1.0",
+            version="1.2.0",
             description="Validates security best practices using the Checkov CLI.",
             llm_description=(
                 "Runs Checkov against the CloudFormation template. Blocks on "
-                "CRITICAL/HIGH findings; records MEDIUM/LOW as non-blocking."
+                "CRITICAL/HIGH findings; records MEDIUM/LOW as non-blocking. "
+                "Each finding carries check_id so RemediationSkill can look up "
+                "the policy source code from checkov_cfn_policy_map.csv via "
+                "checkov_context.get_checkov_policy_context()."
             ),
             phase=SkillPhase.VALIDATION,
             trigger_condition=(
@@ -612,9 +635,12 @@ class CheckovValidatorSkill(Skill):
         line_range = check.get("file_line_range", [0, 0])
         guideline = check.get("guideline", "")
         evaluated_keys = check.get("check_result", {}).get("evaluated_keys", [])
-        remediation = guideline or (
-            f"Review property: {evaluated_keys[0]}" if evaluated_keys else ""
+        # Surface the evaluated CFN property path in the hint so that even
+        # without the full policy context the LLM has a concrete target.
+        property_hint = (
+            f"Fix CFN property: {evaluated_keys[0]}" if evaluated_keys else ""
         )
+        remediation = guideline or property_hint or ""
         return ValidationFinding(
             rule_id=check_id,
             resource_name=resource_name,
