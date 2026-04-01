@@ -395,18 +395,30 @@ class CFNLintValidatorSkill(Skill):
             self._logger.warning(f"Could not parse cfn-lint JSON output: {raw[:200]}")
             return findings
 
-        for match in data:
+        if isinstance(data, dict):
+            data = data.get("matches", data.get("issues", []))
+
+        normalized_matches: list[dict] = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    normalized_matches.append(item)
+                elif isinstance(item, list):
+                    normalized_matches.extend(x for x in item if isinstance(x, dict))
+
+        for match in normalized_matches:
             rule = match.get("Rule", {})
             rule_id = rule.get("Id", "UNKNOWN")
             message = match.get("Message", "")
             first_char = rule_id[0].upper() if rule_id else "W"
             severity = self._SEVERITY_MAP.get(first_char, Severity.MEDIUM)
-            cfn_path = match.get("Location", {}).get("Path", {}).get("CfnPath", [])
+            location = match.get("Location", {}) or {}
+            path_obj = location.get("Path", {}) if isinstance(location, dict) else {}
+            cfn_path = path_obj.get("CfnPath", []) if isinstance(path_obj, dict) else []
             resource_name = cfn_path[1] if len(cfn_path) > 1 else "(template)"
             resource_type = cfn_path[0] if cfn_path else "Template"
-            line_number = (
-                match.get("Location", {}).get("Start", {}).get("LineNumber", 0)
-            )
+            start_obj = location.get("Start", {}) if isinstance(location, dict) else {}
+            line_number = start_obj.get("LineNumber", 0) if isinstance(start_obj, dict) else 0
             findings.append(ValidationFinding(
                 rule_id=rule_id,
                 resource_name=resource_name,
@@ -618,9 +630,23 @@ class CheckovValidatorSkill(Skill):
 
     def _check_to_finding(self, check: dict) -> ValidationFinding:
         check_id = check.get("check_id", "UNKNOWN")
-        check_name = check.get("check", {})
+        check_name = (
+            check.get("check_name")
+            or check.get("check")
+            or check.get("check_title")
+            or check.get("description")
+            or check_id
+        )
         if isinstance(check_name, dict):
-            check_name = check_name.get("name", check_id)
+            check_name = (
+                check_name.get("name")
+                or check_name.get("title")
+                or check_name.get("description")
+                or check_id
+            )
+        if not isinstance(check_name, str):
+            check_name = str(check_name)
+
         raw_resource = check.get("resource", "")
         resource_type, resource_name = (
             raw_resource.rsplit(".", 1) if "." in raw_resource
@@ -638,9 +664,12 @@ class CheckovValidatorSkill(Skill):
         # Surface the evaluated CFN property path in the hint so that even
         # without the full policy context the LLM has a concrete target.
         property_hint = (
-            f"Fix CFN property: {evaluated_keys[0]}" if evaluated_keys else ""
+            "Fix CFN property path(s): " + ", ".join(str(k) for k in evaluated_keys[:5])
+            if evaluated_keys else ""
         )
-        remediation = guideline or property_hint or ""
+        remediation_parts = [p for p in [property_hint, guideline] if p]
+        remediation = " | ".join(remediation_parts)
+
         return ValidationFinding(
             rule_id=check_id,
             resource_name=resource_name,

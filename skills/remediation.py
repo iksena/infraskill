@@ -148,6 +148,23 @@ class RemediationSkill(Skill):
         system = REMEDIATION_SYSTEM_PROMPT.format(
             god_snapshot=god_snapshot_json,
         )
+        
+        def _build_checkov_fallback_context(checkov_findings: list[ValidationFinding]) -> str:
+            parts: list[str] = []
+            for f in checkov_findings:
+                parts.append(
+                    "\n".join([
+                        f"### {f.rule_id} on {f.resource_name}",
+                        f"- Resource type: {f.resource_type}",
+                        f"- Human-readable issue: {f.message or f.rule_id}",
+                        f"- Fix target: {f.remediation_hint or 'See finding details in validator output'}",
+                        (
+                            f"- Check ID: {f.check_id}"
+                            if getattr(f, "check_id", None) else ""
+                        ),
+                    ]).strip()
+                )
+            return "\n\n".join(parts)
 
         # ------------------------------------------------------------------
         # Checkov policy context — inject source code for CKV_* findings so
@@ -156,16 +173,18 @@ class RemediationSkill(Skill):
         # ------------------------------------------------------------------
         checkov_findings = [f for f in findings if (f.rule_id or "").startswith("CKV_")]
         policy_context_block = ""
+        policy_context_injected = False
         if checkov_findings:
             policy_context = get_checkov_policy_context(checkov_findings)
-            if policy_context:
-                policy_context_block = (
-                    "\n\n## Security Policy Reference\n"
-                    "The following Checkov check source code defines exactly which "
-                    "CloudFormation property path is inspected and what value makes "
-                    "each check pass. Use this to determine the precise fix:\n\n"
-                    f"{policy_context}\n"
-                )
+            fallback_context = _build_checkov_fallback_context(checkov_findings)
+            effective_context = (policy_context or "").strip() or fallback_context
+            policy_context_block = (
+                "\n\n## Security Policy Reference\n"
+                "Use the following security context to determine the exact "
+                "CloudFormation property path and compliant value(s) that must be fixed.\n\n"
+                f"{effective_context}\n"
+            )
+            policy_context_injected = bool(effective_context.strip())
 
         user_message = (
             f"## Current template (round {round_num})\n"
@@ -178,6 +197,12 @@ class RemediationSkill(Skill):
             f"{remediation_hints}"
             f"{policy_context_block}"
         )
+
+        if checkov_findings and "## Security Policy Reference" not in user_message:
+            self._logger.warning(
+                "  [llm-fix] Expected security policy context in prompt but section "
+                "header is missing after prompt assembly"
+            )
 
         self._logger.info(
             f"  [llm-fix] Sending {len(findings)} findings to LLM (round {round_num})"
@@ -216,6 +241,9 @@ class RemediationSkill(Skill):
                     "finding_ids": [f.rule_id for f in findings],
                     "all_finding_count": len(all_findings),
                     "checkov_policy_context_count": len(checkov_findings),
+                    "checkov_finding_count": len(checkov_findings),
+                    "checkov_policy_context_injected": policy_context_injected,
+                    "checkov_policy_reference_present": "## Security Policy Reference" in user_message,
                 },
             )
 

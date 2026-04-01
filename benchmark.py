@@ -430,14 +430,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--max-remediation-rounds",
         type=int,
-        default=30,
+        default=50,
         dest="max_remediation_rounds",
         help="Max remediation rounds per scenario.",
     )
     parser.add_argument(
         "--max-iterations",
         type=int,
-        default=30,
+        default=50,
         dest="max_total_iterations",
         help="Max total iterations per scenario.",
     )
