@@ -298,6 +298,7 @@ class BenchmarkRunner:
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "csv_path": str(self.csv_path),
             "model": self.model,
+            "orchestrator_config_overrides": self.config_overrides,
             "total_scenarios": total,
             "succeeded": succeeded,
             "failed": failed,
@@ -442,6 +443,23 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Max total iterations per scenario.",
     )
     parser.add_argument(
+        "--routing-mode",
+        choices=["deterministic", "hybrid", "llm_first"],
+        default="deterministic",
+        dest="routing_mode",
+        help=(
+            "Skill routing strategy: deterministic (phase priority), "
+            "hybrid (phase + policy chooser), or llm_first (policy over all triggerable skills)."
+        ),
+    )
+    parser.add_argument(
+        "--llm-policy-timeout-seconds",
+        type=int,
+        default=20,
+        dest="llm_policy_timeout_seconds",
+        help="Timeout in seconds for LLM policy decisions.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose orchestrator logging.",
@@ -458,6 +476,8 @@ def main(argv=None):
     config_overrides = {
         "max_remediation_rounds": args.max_remediation_rounds,
         "max_total_iterations": args.max_total_iterations,
+        "routing_mode": args.routing_mode,
+        "llm_policy_timeout_seconds": args.llm_policy_timeout_seconds,
         "verbose_logging": args.verbose,
     }
 

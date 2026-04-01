@@ -148,3 +148,32 @@ SKILL_SELECTOR_PROMPT = """\
     - If acceptance criteria are unmet, prefer intent-alignment repair over structural fixes.
     - Return ONLY a JSON object: {"skill_name": "<name>", "rationale": "<one sentence>"}
     """
+
+
+ORCHESTRATION_POLICY_PROMPT = """\
+You are the orchestration policy brain for an AWS CloudFormation skill-based pipeline.
+Given the current GOD state, recent execution history, and triggerable skills,
+choose exactly one skill to execute next.
+
+## Current Orchestrator Context
+{orchestrator_context}
+
+## Current GOD Snapshot
+{god_snapshot}
+
+## Triggerable Skills
+{triggerable_skills}
+
+## Hard Rules (must obey)
+- You MUST choose only from triggerable skills.
+- Prefer the action that most improves template validity and deployability.
+- If there are blocking validation findings, prefer remediation-oriented skills.
+- If validations are still pending and a validator is triggerable, prefer validation
+  before major re-generation.
+- If intent is incomplete or wrong, choose planning/re-planning paths.
+- If template is missing/incomplete, choose engineering paths.
+
+## Output Format
+Return ONLY JSON:
+{"skill_name": "<exact skill name>", "rationale": "<short reason>", "confidence": <0.0-1.0>}
+"""

@@ -42,7 +42,7 @@ from enums import OrchestratorState, SkillPhase
 from god import GroundedObjectivesDocument
 from llm_client import OpenRouterClient
 from logger import setup_logging
-from prompt import SKILL_SELECTOR_PROMPT
+from prompt import ORCHESTRATION_POLICY_PROMPT, SKILL_SELECTOR_PROMPT
 from skill_framework import Skill, SkillContext, SkillRegistry, SkillResult
 from skills.engineer import GeneralEngineerSkill
 from skills.planner import PlannerSkill
@@ -113,6 +113,13 @@ class OrchestratorConfig:
 
     # Execution
     skill_timeout_seconds: int = 3600
+    llm_policy_timeout_seconds: int = 20
+
+    # Routing mode:
+    # - deterministic: phase/state routing + priority fallback only
+    # - hybrid: deterministic phase routing + LLM chooser among phase candidates
+    # - llm_first: LLM chooses among all triggerable skills
+    routing_mode: str = "deterministic"
 
     llm_client: Optional[object] = None
 
@@ -129,6 +136,8 @@ class OrchestratorConfig:
             "enable_checkpoints": self.enable_checkpoints,
             "enable_telemetry": self.enable_telemetry,
             "telemetry_dir": self.telemetry_dir,
+            "routing_mode": self.routing_mode,
+            "llm_policy_timeout_seconds": self.llm_policy_timeout_seconds,
         }
 
 
@@ -356,6 +365,92 @@ class Orchestrator:
         }
         return mapping.get(state)
 
+    def _phase_to_state(self, phase: SkillPhase) -> Optional[OrchestratorState]:
+        mapping = {
+            SkillPhase.PLANNING: OrchestratorState.PLANNING,
+            SkillPhase.ENGINEERING: OrchestratorState.ENGINEERING,
+            SkillPhase.ASSEMBLY: OrchestratorState.ASSEMBLING,
+            SkillPhase.VALIDATION: OrchestratorState.VALIDATING,
+            SkillPhase.REMEDIATION: OrchestratorState.REMEDIATING,
+        }
+        return mapping.get(phase)
+
+    def _set_current_phase(self, target_phase: SkillPhase):
+        if target_phase == self._current_phase:
+            return
+        old_phase = self._current_phase
+        self._current_phase = target_phase
+        self.events.emit(OrchestratorEventType.PHASE_CHANGED, {
+            "old_phase": old_phase.name if old_phase else None,
+            "new_phase": target_phase.name,
+        })
+        if self._telemetry:
+            self._telemetry.record_orchestrator_event(
+                event_type="PHASE_CHANGED",
+                iteration=self._iteration,
+                data={
+                    "old_phase": old_phase.name if old_phase else None,
+                    "new_phase": target_phase.name,
+                },
+            )
+
+    def _select_skill_via_llm_policy(self, candidates: list[Skill], scope: str) -> Optional[Skill]:
+        llm = self.config.llm_client
+        if llm is None or not candidates:
+            return None
+
+        orchestrator_context = {
+            "state": self.state.name,
+            "iteration": self._iteration,
+            "routing_mode": self.config.routing_mode,
+            "scope": scope,
+            "recent_executions": self._execution_log[-5:],
+        }
+        god_snapshot = self.god.snapshot() if self.god else {}
+        candidate_table = [s.metadata.to_dict() for s in candidates]
+
+        try:
+            raw = llm.complete(
+                system=ORCHESTRATION_POLICY_PROMPT.format(
+                    orchestrator_context=json.dumps(orchestrator_context, indent=2),
+                    god_snapshot=json.dumps(god_snapshot, indent=2),
+                    triggerable_skills=json.dumps(candidate_table, indent=2),
+                ),
+                user="Choose the next best skill.",
+                temperature=0.0,
+                timeout=self.config.llm_policy_timeout_seconds,
+            )
+            decision = json.loads(raw)
+            chosen_name = decision["skill_name"]
+            rationale = decision.get("rationale", "")
+            confidence = decision.get("confidence")
+            selected = self.registry.get(chosen_name)
+            if selected and selected in candidates:
+                self._logger.info(
+                    f"Policy selected skill '{chosen_name}'"
+                    + (f" (confidence={confidence})" if confidence is not None else "")
+                    + (f": {rationale}" if rationale else "")
+                )
+                if self._telemetry:
+                    self._telemetry.record_orchestrator_event(
+                        event_type="POLICY_SKILL_SELECTED",
+                        iteration=self._iteration,
+                        data={
+                            "scope": scope,
+                            "skill_name": chosen_name,
+                            "rationale": rationale,
+                            "confidence": confidence,
+                        },
+                    )
+                return selected
+            self._logger.warning(
+                f"Policy chose '{chosen_name}' not in candidate set ({scope}); "
+                "falling back to deterministic priority"
+            )
+        except Exception as exc:
+            self._logger.warning(f"Policy selection failed ({scope}): {exc}")
+        return None
+
     # -------------------------------------------------------------------------
     # Skill selection
     # -------------------------------------------------------------------------
@@ -378,69 +473,97 @@ class Orchestrator:
         if self.state.is_terminal():
             return None
 
-        target_phase = self._state_to_phase(self.state)
-        if target_phase is None:
-            return None
-
-        if target_phase != self._current_phase:
-            old_phase = self._current_phase
-            self._current_phase = target_phase
-            self.events.emit(OrchestratorEventType.PHASE_CHANGED, {
-                "old_phase": old_phase.name if old_phase else None,
-                "new_phase": target_phase.name,
-            })
-            if self._telemetry:
-                self._telemetry.record_orchestrator_event(
-                    event_type="PHASE_CHANGED",
-                    iteration=self._iteration,
-                    data={"old_phase": old_phase.name if old_phase else None,
-                          "new_phase": target_phase.name},
-                )
-
-        phase_skills = self.registry.get_by_phase(target_phase)
-        candidates = [s for s in phase_skills if s.can_trigger(self.god)]
-
-        if not candidates:
-            return None
-
-        if len(candidates) == 1:
-            return candidates[0]
-
-        llm = self.config.llm_client
-        if llm is None:
-            return candidates[0]
-
-        god_snapshot = json.dumps(self.god.intent.to_dict(), indent=2)
-        candidate_table = json.dumps(
-            [s.metadata.to_dict() for s in candidates], indent=2
-        )
-
-        try:
-            raw = llm.complete(
-                system=SKILL_SELECTOR_PROMPT.format(
-                    god_snapshot=god_snapshot,
-                    skill_metadata_table=candidate_table,
-                ),
-                user="Which skill should run next?",
-                temperature=0.0,
-                timeout=15,
-            )
-            decision = json.loads(raw)
-            chosen_name = decision["skill_name"]
-            rationale = decision.get("rationale", "")
-            skill = self.registry.get(chosen_name)
-            if skill and skill in candidates:
-                self._logger.info(f"LLM selected skill '{chosen_name}': {rationale}")
-                return skill
+        # Determine candidate set based on routing mode.
+        routing_mode = (self.config.routing_mode or "deterministic").lower()
+        if routing_mode not in ("deterministic", "hybrid", "llm_first"):
             self._logger.warning(
-                f"LLM chose '{chosen_name}' not in candidates for phase "
-                f"{target_phase.name}; falling back to priority routing"
+                f"Unknown routing_mode='{self.config.routing_mode}', defaulting to deterministic"
             )
-            return candidates[0]
-        except (json.JSONDecodeError, KeyError):
-            return candidates[0]
-        except Exception:
-            return candidates[0]
+            routing_mode = "deterministic"
+
+        selected_skill: Optional[Skill] = None
+
+        if routing_mode == "llm_first":
+            global_candidates = self.registry.get_triggerable(self.god)
+            if not global_candidates:
+                return None
+            selected_skill = self._select_skill_via_llm_policy(global_candidates, scope="global")
+            if selected_skill is None:
+                selected_skill = global_candidates[0]
+                self._logger.info(
+                    f"Policy fallback -> priority skill '{selected_skill.metadata.name}'"
+                )
+        else:
+            target_phase = self._state_to_phase(self.state)
+            if target_phase is None:
+                return None
+
+            self._set_current_phase(target_phase)
+
+            phase_skills = self.registry.get_by_phase(target_phase)
+            candidates = [s for s in phase_skills if s.can_trigger(self.god)]
+
+            if not candidates:
+                return None
+
+            if routing_mode == "hybrid" and len(candidates) > 1:
+                selected_skill = self._select_skill_via_llm_policy(candidates, scope="phase")
+
+            if selected_skill is None:
+                if len(candidates) == 1:
+                    selected_skill = candidates[0]
+                else:
+                    llm = self.config.llm_client
+                    if llm is None:
+                        selected_skill = candidates[0]
+                    else:
+                        god_snapshot = json.dumps(self.god.intent.to_dict(), indent=2)
+                        candidate_table = json.dumps(
+                            [s.metadata.to_dict() for s in candidates], indent=2
+                        )
+
+                        try:
+                            raw = llm.complete(
+                                system=SKILL_SELECTOR_PROMPT.format(
+                                    god_snapshot=god_snapshot,
+                                    skill_metadata_table=candidate_table,
+                                ),
+                                user="Which skill should run next?",
+                                temperature=0.0,
+                                timeout=15,
+                            )
+                            decision = json.loads(raw)
+                            chosen_name = decision["skill_name"]
+                            rationale = decision.get("rationale", "")
+                            skill = self.registry.get(chosen_name)
+                            if skill and skill in candidates:
+                                self._logger.info(f"LLM selected skill '{chosen_name}': {rationale}")
+                                selected_skill = skill
+                            else:
+                                self._logger.warning(
+                                    f"LLM chose '{chosen_name}' not in candidates for phase "
+                                    f"{target_phase.name}; falling back to priority routing"
+                                )
+                                selected_skill = candidates[0]
+                        except (json.JSONDecodeError, KeyError):
+                            selected_skill = candidates[0]
+                        except Exception:
+                            selected_skill = candidates[0]
+
+        if selected_skill is None:
+            return None
+
+        # Keep state/phase coherent with selected skill even in llm_first mode.
+        selected_phase = selected_skill.metadata.phase
+        self._set_current_phase(selected_phase)
+        desired_state = self._phase_to_state(selected_phase)
+        if desired_state and not self.state.is_terminal() and desired_state != self.state:
+            self._transition_to(
+                desired_state,
+                f"selected skill '{selected_skill.metadata.name}' ({selected_phase.name})",
+            )
+
+        return selected_skill
 
     def _execute_skill(self, skill: Skill) -> SkillResult:
         timeout_s = self.config.skill_timeout_seconds
