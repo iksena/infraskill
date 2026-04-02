@@ -59,15 +59,6 @@ class GeneralEngineerSkill(Skill):
             ],
             priority=10,
             tags=["llm", "engineering", "cloudformation"],
-            examples=[
-                {
-                    "input": {
-                        "resources": ["AWS::S3::Bucket", "AWS::IAM::Role"],
-                        "constraints": {"encryption_at_rest": True},
-                    },
-                    "output": "Complete CFN YAML with all resources, parameters, outputs",
-                }
-            ],
         )
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:

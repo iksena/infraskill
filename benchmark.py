@@ -192,7 +192,6 @@ class BenchmarkRunner:
         llm = OpenRouterClient(model=self.model)
 
         base_kwargs = dict(
-            max_remediation_rounds=3,
             max_total_iterations=30,
             verbose_logging=False,
             log_god_snapshots=False,
@@ -429,35 +428,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Skip rows already present in an existing results.jsonl.",
     )
     parser.add_argument(
-        "--max-remediation-rounds",
-        type=int,
-        default=50,
-        dest="max_remediation_rounds",
-        help="Max remediation rounds per scenario.",
-    )
-    parser.add_argument(
         "--max-iterations",
         type=int,
         default=50,
         dest="max_total_iterations",
         help="Max total iterations per scenario.",
-    )
-    parser.add_argument(
-        "--routing-mode",
-        choices=["deterministic", "hybrid", "llm_first"],
-        default="deterministic",
-        dest="routing_mode",
-        help=(
-            "Skill routing strategy: deterministic (phase priority), "
-            "hybrid (phase + policy chooser), or llm_first (policy over all triggerable skills)."
-        ),
-    )
-    parser.add_argument(
-        "--llm-policy-timeout-seconds",
-        type=int,
-        default=20,
-        dest="llm_policy_timeout_seconds",
-        help="Timeout in seconds for LLM policy decisions.",
     )
     parser.add_argument(
         "--verbose",
@@ -474,10 +449,7 @@ def main(argv=None):
     setup_logging(log_level)
 
     config_overrides = {
-        "max_remediation_rounds": args.max_remediation_rounds,
         "max_total_iterations": args.max_total_iterations,
-        "routing_mode": args.routing_mode,
-        "llm_policy_timeout_seconds": args.llm_policy_timeout_seconds,
         "verbose_logging": args.verbose,
     }
 

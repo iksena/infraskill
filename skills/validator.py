@@ -24,9 +24,9 @@
 # (Code/main.py) so the LLM sees the exact scan_resource_conf() logic and
 # knows precisely which CFN property path to fix.
 #
-# Progressive disclosure:
-#   All heavy imports (yaml, subprocess, shutil, json, re) are deferred to
-#   load_level2() so the orchestrator pays nothing at registration time.
+# Runtime loading:
+#   Heavy imports (yaml, subprocess, shutil, json, re) are initialized lazily
+#   on the first execute() call for each validator.
 # -----------------------------------------------------------------------------
 
 from datetime import datetime
@@ -107,8 +107,7 @@ class YAMLSyntaxValidatorSkill(Skill):
     intrinsic function tags (!Ref, !Sub, !GetAtt, …).
 
     Static / pure-Python — no LLM, no CLI tool.
-    Progressive disclosure: yaml/yamllint modules imported lazily in
-    load_level2().
+    YAML tooling is imported lazily on first execute().
     """
 
     # yamllint config mirrors the IaCGen evaluation pipeline settings so that
@@ -150,24 +149,25 @@ class YAMLSyntaxValidatorSkill(Skill):
             tags=["static", "syntax", "yaml"],
         )
 
-    def load_level2(self) -> bool:
-        if not self._level2_loaded:
-            import yaml as _yaml
-            self._yaml = _yaml
-            try:
-                from yamllint import linter as _linter
-                from yamllint.config import YamlLintConfig as _YamlLintConfig
-                self._linter = _linter
-                self._YamlLintConfig = _YamlLintConfig
-                self._yamllint_available = True
-            except ImportError:
-                self._logger.warning(
-                    "yamllint not installed; falling back to PyYAML CFN parse only. "
-                    "Install with: pip install yamllint"
-                )
-                self._yamllint_available = False
-            self._level2_loaded = True
-        return True
+    def _ensure_runtime(self):
+        if getattr(self, "_runtime_initialized", False):
+            return
+
+        import yaml as _yaml
+        self._yaml = _yaml
+        try:
+            from yamllint import linter as _linter
+            from yamllint.config import YamlLintConfig as _YamlLintConfig
+            self._linter = _linter
+            self._YamlLintConfig = _YamlLintConfig
+            self._yamllint_available = True
+        except ImportError:
+            self._logger.warning(
+                "yamllint not installed; falling back to PyYAML CFN parse only. "
+                "Install with: pip install yamllint"
+            )
+            self._yamllint_available = False
+        self._runtime_initialized = True
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
         return (
@@ -176,6 +176,7 @@ class YAMLSyntaxValidatorSkill(Skill):
         )
 
     def execute(self, context: SkillContext) -> SkillResult:
+        self._ensure_runtime()
         god = context.god
         template_body = god.template.body
 
@@ -286,16 +287,17 @@ class CFNLintValidatorSkill(Skill):
             tags=["static", "cfn-lint", "schema", "cloudformation"],
         )
 
-    def load_level2(self) -> bool:
-        if not self._level2_loaded:
-            import shutil as _shutil
-            import subprocess as _subprocess
-            import json as _json
-            self._shutil = _shutil
-            self._subprocess = _subprocess
-            self._json = _json
-            self._level2_loaded = True
-        return True
+    def _ensure_runtime(self):
+        if getattr(self, "_runtime_initialized", False):
+            return
+
+        import shutil as _shutil
+        import subprocess as _subprocess
+        import json as _json
+        self._shutil = _shutil
+        self._subprocess = _subprocess
+        self._json = _json
+        self._runtime_initialized = True
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
         # yaml_syntax must be PASS (not just non-ERROR) — broken YAML cannot
@@ -306,6 +308,7 @@ class CFNLintValidatorSkill(Skill):
         )
 
     def execute(self, context: SkillContext) -> SkillResult:
+        self._ensure_runtime()
         god = context.god
         skill_result = SkillResult(success=True, skill_name=self.metadata.name)
 
@@ -503,18 +506,19 @@ class CheckovValidatorSkill(Skill):
             tags=["static", "security", "checkov"],
         )
 
-    def load_level2(self) -> bool:
-        if not self._level2_loaded:
-            import shutil as _shutil
-            import subprocess as _subprocess
-            import json as _json
-            import re as _re
-            self._shutil = _shutil
-            self._subprocess = _subprocess
-            self._json = _json
-            self._re = _re
-            self._level2_loaded = True
-        return True
+    def _ensure_runtime(self):
+        if getattr(self, "_runtime_initialized", False):
+            return
+
+        import shutil as _shutil
+        import subprocess as _subprocess
+        import json as _json
+        import re as _re
+        self._shutil = _shutil
+        self._subprocess = _subprocess
+        self._json = _json
+        self._re = _re
+        self._runtime_initialized = True
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
         # Accept cfn_lint=ERROR (tool absent) as equivalent to PASS so the
@@ -525,6 +529,7 @@ class CheckovValidatorSkill(Skill):
         )
 
     def execute(self, context: SkillContext) -> SkillResult:
+        self._ensure_runtime()
         god = context.god
         skill_result = SkillResult(success=True, skill_name=self.metadata.name)
 
@@ -792,12 +797,12 @@ class IntentAlignmentValidatorSkill(Skill):
             tags=["llm", "intent", "accuracy", "coverage"],
         )
 
-    def load_level2(self) -> bool:
-        if not self._level2_loaded:
-            import json as _json
-            self._json = _json
-            self._level2_loaded = True
-        return True
+    def _ensure_runtime(self):
+        if getattr(self, "_runtime_initialized", False):
+            return
+        import json as _json
+        self._json = _json
+        self._runtime_initialized = True
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
         # Accept checkov=ERROR (tool absent) as equivalent to PASS.
@@ -807,6 +812,7 @@ class IntentAlignmentValidatorSkill(Skill):
         )
 
     def execute(self, context: SkillContext) -> SkillResult:
+        self._ensure_runtime()
         god = context.god
         skill_result = SkillResult(success=True, skill_name=self.metadata.name)
 

@@ -7,7 +7,7 @@ import json
 import time
 from typing import Optional
 
-from enums import SkillPhase
+from enums import Severity, SkillPhase, ValidationStatus
 from god import AcceptanceCriterion, Constraints, ExtractedResource, GroundedObjectivesDocument
 from llm_client import OpenRouterClient
 from prompt import PLANNER_SYSTEM_PROMPT
@@ -38,7 +38,10 @@ class PlannerSkill(Skill):
                 "generated CloudFormation template."
             ),
             phase=SkillPhase.PLANNING,
-            trigger_condition="intent.raw_prompt exists AND intent.resources is empty",
+            trigger_condition=(
+                "intent.raw_prompt exists AND (intent.resources is empty OR "
+                "intent_alignment has blocking findings)"
+            ),
             writes_to=[
                 "intent.resources",
                 "intent.constraints",
@@ -46,6 +49,7 @@ class PlannerSkill(Skill):
                 "intent.normalized_prompt",
                 "intent.parsed_at",
                 "intent.parser_version",
+                "template.body (cleared only during re-plan)",
             ],
             reads_from=["intent.raw_prompt"],
             priority=10,
@@ -53,7 +57,21 @@ class PlannerSkill(Skill):
         )
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
-        return bool(god.intent.raw_prompt) and not god.intent.resources
+        if not god.intent.raw_prompt:
+            return False
+        if not god.intent.resources:
+            return True
+
+        intent_validation = god.validation_state.get("intent_alignment")
+        if not intent_validation:
+            return False
+        if intent_validation.status != ValidationStatus.FAIL:
+            return False
+
+        return any(
+            f.severity in (Severity.CRITICAL, Severity.HIGH)
+            for f in intent_validation.findings
+        )
 
     # ------------------------------------------------------------------
     # Main execute
@@ -130,7 +148,9 @@ class PlannerSkill(Skill):
                 "Check model availability or prompt.",
             )
 
+        is_replan = bool(god.template.body)
         before_resources = list(god.intent.resources) if god.intent.resources else []
+        before_template_body = god.template.body
         god.intent.resources = [ExtractedResource(**r) for r in data["resources"]]
         god.intent.constraints = Constraints(**data["constraints"])
         god.intent.acceptance_criteria = [
@@ -161,6 +181,23 @@ class PlannerSkill(Skill):
                 after=[str(c) for c in god.intent.acceptance_criteria],
                 changed_by=self.metadata.name,
                 iteration=iteration,
+            )
+
+        if is_replan:
+            god.template.body = ""
+            god.template.resources = {}
+            god.template.increment_version(self.metadata.name)
+            god.reset_validations_from("yaml_syntax", self.metadata.name, skip_errored=True)
+            if tel:
+                tel.record_god_change(
+                    field="template.body",
+                    before=before_template_body,
+                    after="(cleared for regeneration after re-plan)",
+                    changed_by=self.metadata.name,
+                    iteration=iteration,
+                )
+            result.changes_made.append(
+                "Detected intent drift findings; cleared template to force regeneration"
             )
 
         result.changes_made.append(

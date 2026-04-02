@@ -14,12 +14,7 @@ from god import GroundedObjectivesDocument
 @dataclass
 class SkillMetadata:
     """
-    Level 1 Metadata — Always in memory for routing decisions.
-
-    Progressive disclosure levels:
-      L1 (this dataclass) — always resident: name, phase, priority, trigger_condition
-      L2 (load_level2)   — loaded on activation: procedural logic / imported modules
-      L3 (load_level3)   — loaded on demand:  large schemas, embedding indexes, etc.
+        Routing metadata always available to the orchestrator.
     """
     # ---- Required -------------------------------------------------------
     name: str
@@ -34,17 +29,10 @@ class SkillMetadata:
 
     # ---- Execution parameters -------------------------------------------
     priority: int = 100         # Lower = higher priority within the same phase
-    timeout_seconds: int = 60
-    retryable: bool = True
-    max_retries: int = 2
 
     # ---- Provenance & discoverability -----------------------------------
     version: str = "1.0.0"      # Semver; bump on behaviour-breaking changes
     tags: list[str] = field(default_factory=list)  # e.g. ["llm", "static", "security"]
-    examples: list[dict] = field(default_factory=list)  # [{"input": ..., "output": ...}]
-
-    # ---- Graph wiring ---------------------------------------------------
-    requires_skills: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -58,7 +46,6 @@ class SkillMetadata:
             "trigger_condition": self.trigger_condition,
             "writes_to": self.writes_to,
             "reads_from": self.reads_from,
-            "requires_skills": self.requires_skills,
         }
 
 
@@ -68,9 +55,6 @@ class SkillContext:
     god: GroundedObjectivesDocument
     orchestrator_state: OrchestratorState
     iteration: int
-    triggered_by: str = "orchestrator"
-    retry_count: int = 0
-    parent_skill: Optional[str] = None
     config: dict = field(default_factory=dict)
 
     def get_config(self, key: str, default: Any = None) -> Any:
@@ -119,19 +103,8 @@ class Skill(ABC):
     """
     Abstract base class for all skills.
 
-    Three-level progressive disclosure pattern
-    ==========================================
-    Level 1 — Metadata (always resident)
-        _define_metadata() is called once in __init__ and cached.
-        Orchestrator routing decisions never pay more than a dict lookup.
-
-    Level 2 — Procedural logic (loaded on first activation)
-        Override load_level2() to do one-time imports / lightweight setup.
-        Called automatically by pre_execute().
-
-    Level 3 — Heavy assets (loaded on demand, unloaded after use)
-        Override load_level3() for large schemas, embedding indexes, etc.
-        Override unload_level3() to release memory after execution.
+    Metadata is loaded once at construction time and skill execution is driven
+    purely by can_trigger() + execute().
 
     Subclasses must implement:
         _define_metadata()  → SkillMetadata
@@ -142,8 +115,6 @@ class Skill(ABC):
     def __init__(self):
         self._logger = logging.getLogger(f"INFRA-SKILL.Skill.{self.__class__.__name__}")
         self.metadata = self._define_metadata()
-        self._level2_loaded = False
-        self._level3_loaded = False
         self._execution_count = 0
         self._total_duration_ms = 0
 
@@ -159,33 +130,8 @@ class Skill(ABC):
     def execute(self, context: SkillContext) -> SkillResult:
         pass
 
-    # ------------------------------------------------------------------
-    # Progressive disclosure hooks
-    # ------------------------------------------------------------------
-
-    def load_level2(self) -> bool:
-        """Load Level-2 assets (imports, caches). Called before first execute."""
-        if not self._level2_loaded:
-            self._logger.debug(f"[L2] Loading {self.metadata.name}")
-            self._level2_loaded = True
-        return True
-
-    def load_level3(self) -> bool:
-        """Load Level-3 assets (heavy resources). Override for lazy loading."""
-        if not self._level3_loaded:
-            self._logger.debug(f"[L3] Loading {self.metadata.name}")
-            self._level3_loaded = True
-        return True
-
-    def unload_level3(self):
-        """Release Level-3 assets to free memory after execution."""
-        if self._level3_loaded:
-            self._logger.debug(f"[L3] Unloading {self.metadata.name}")
-            self._level3_loaded = False
-
     def pre_execute(self, context: SkillContext) -> tuple[bool, str]:
-        """Pre-execution hook. Loads L2 and returns (proceed, reason)."""
-        self.load_level2()
+        """Pre-execution hook."""
         return True, ""
 
     def post_execute(self, context: SkillContext, result: SkillResult):
