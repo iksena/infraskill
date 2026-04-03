@@ -111,7 +111,7 @@ class TelemetryRecorder:
 
         # Write a run-start marker to each stream
         header = {"event": "run_start", "run_id": run_id, "timestamp": self._started_at,
-                  "prompt_snippet": prompt[:200], "config": config}
+                  "prompt_snippet": prompt, "config": config}
         for name in self._fh:
             self._write_jsonl(name, header)
 
@@ -345,7 +345,7 @@ class TelemetryRecorder:
                 "run_id": self._run_id,
                 "started_at": self._started_at,
                 "finished_at": finished_at,
-                "prompt_snippet": self._prompt[:120].replace("\n", " "),
+                "prompt_snippet": self._prompt.replace("\n", " "),
                 "final_state": final_state,
                 "iterations": iterations,
                 "duration_ms": round(duration_ms, 1),

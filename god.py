@@ -222,6 +222,7 @@ class GroundedObjectivesDocument:
         "yaml_syntax",
         "cfn_lint",
         "checkov",
+        "trivy",
     ]
 
     def __init__(self):
@@ -344,6 +345,7 @@ class GroundedObjectivesDocument:
         from_validator: str,
         actor: str = "unknown",
         skip_errored: bool = True,
+        skip_skipped: bool = True,
     ):
         """
         Reset validators at and after *from_validator* back to PENDING so they
@@ -358,6 +360,12 @@ class GroundedObjectivesDocument:
 
         Only set skip_errored=False in tests or when you explicitly want to
         force a re-run of an errored validator.
+
+        skip_skipped (default True)
+        ---------------------------
+        When True, validators currently in SKIPPED status are NOT reset.
+        This preserves intentionally disabled validators (e.g. inactive
+        backend choice between checkov and trivy).
         """
         pipeline = self.VALIDATION_PIPELINE
         try:
@@ -373,6 +381,11 @@ class GroundedObjectivesDocument:
             if skip_errored and current.status == ValidationStatus.ERROR:
                 self._logger.debug(
                     f"  Skipping reset of '{name}' (status=ERROR, tool unavailable)"
+                )
+                continue
+            if skip_skipped and current.status == ValidationStatus.SKIPPED:
+                self._logger.debug(
+                    f"  Skipping reset of '{name}' (status=SKIPPED, intentionally disabled)"
                 )
                 continue
             self.validation_state[name] = ValidationResult(validator_name=name)

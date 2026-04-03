@@ -35,13 +35,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Callable
 from datetime import datetime
-from enums import OrchestratorState, SkillPhase
-from god import GroundedObjectivesDocument
+from enums import OrchestratorState, SkillPhase, ValidationStatus
+from god import GroundedObjectivesDocument, ValidationResult
 from skill_framework import Skill, SkillContext, SkillRegistry, SkillResult
 from skills.engineer import GeneralEngineerSkill
 from skills.planner import PlannerSkill
 from skills.remediation import RemediationSkill
-from skills.validator import CFNLintValidatorSkill, CheckovValidatorSkill, YAMLSyntaxValidatorSkill
+from skills.validator import (
+    CFNLintValidatorSkill,
+    CheckovValidatorSkill,
+    TrivyValidatorSkill,
+    YAMLSyntaxValidatorSkill,
+)
 from telemetry import TelemetryRecorder
 
 
@@ -64,6 +69,7 @@ def create_default_skills() -> list[Skill]:
     VALIDATION  : YAMLSyntaxValidatorSkill (priority 10)
                   CFNLintValidatorSkill    (priority 20)
                   CheckovValidatorSkill    (priority 30)
+                  TrivyValidatorSkill      (priority 30, alternative backend)
     REMEDIATION : RemediationSkill
     """
     return [
@@ -72,6 +78,7 @@ def create_default_skills() -> list[Skill]:
         YAMLSyntaxValidatorSkill(),
         CFNLintValidatorSkill(),
         CheckovValidatorSkill(),
+        TrivyValidatorSkill(),
         RemediationSkill(),
     ]
 
@@ -107,6 +114,10 @@ class OrchestratorConfig:
     engineer_max_output_tokens: int = 8192
     remediation_max_output_tokens: int = 8192
 
+    # Validation backend selection for security scan phase.
+    # Allowed values: "checkov" or "trivy".
+    validator_backend: str = "trivy"
+
     def to_dict(self) -> dict:
         return {
             "max_total_iterations": self.max_total_iterations,
@@ -115,6 +126,7 @@ class OrchestratorConfig:
             "telemetry_dir": self.telemetry_dir,
             "engineer_max_output_tokens": self.engineer_max_output_tokens,
             "remediation_max_output_tokens": self.remediation_max_output_tokens,
+            "validator_backend": self.validator_backend,
         }
 
 
@@ -434,6 +446,7 @@ class Orchestrator:
                 "telemetry": self._telemetry,
                 "engineer_max_output_tokens": self.config.engineer_max_output_tokens,
                 "remediation_max_output_tokens": self.config.remediation_max_output_tokens,
+                "validator_backend": self.config.validator_backend,
             }
         )
         self.events.emit(OrchestratorEventType.SKILL_STARTED, {
@@ -560,6 +573,23 @@ class Orchestrator:
 
         self.god = GroundedObjectivesDocument()
         self.god.intent.raw_prompt = user_prompt
+
+        backend = (self.config.validator_backend or "checkov").strip().lower()
+        if backend not in {"checkov", "trivy"}:
+            self._logger.warning(
+                f"Unknown validator_backend='{self.config.validator_backend}', falling back to 'checkov'"
+            )
+            backend = "checkov"
+            self.config.validator_backend = "checkov"
+
+        inactive_validator = "trivy" if backend == "checkov" else "checkov"
+        self.god.template.metadata["validator_backend"] = backend
+        self.god.validation_state[inactive_validator] = ValidationResult(
+            status=ValidationStatus.SKIPPED,
+            validator_name=inactive_validator,
+            errors=[f"{inactive_validator} skipped (validator_backend={backend})"],
+        )
+
         self.god.lock_field("intent.raw_prompt", "orchestrator")
         self.god.save_checkpoint("initialized", "orchestrator")
         self._transition_to(OrchestratorState.INITIALIZING, "pipeline start")

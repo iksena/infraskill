@@ -20,13 +20,13 @@ _REMEDIATION_HINT_SYSTEM_PROMPT = """\
 You are an AWS CloudFormation remediation assistant.
 
 Task:
-- Analyze validation failures (yaml syntax, cfn-lint, checkov).
+- Analyze validation failures (yaml syntax, cfn-lint, checkov, trivy).
 - Produce concrete remediation guidance for the next template generation pass.
 
 Output rules:
 - Return plain text only (no markdown code fences).
 - Be concise and actionable.
-- Group by validator: YAML, CFN-LINT, CHECKOV.
+- Group by validator: YAML, CFN-LINT, CHECKOV, TRIVY.
 - For each finding include:
     1) probable root cause,
     2) exact CloudFormation property path(s) to change,

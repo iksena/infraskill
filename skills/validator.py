@@ -255,12 +255,6 @@ class CFNLintValidatorSkill(Skill):
     Install: pip install cfn-lint
     """
 
-    _SEVERITY_MAP = {
-        "E": Severity.CRITICAL,
-        "W": Severity.HIGH,
-        "I": Severity.INFO,
-    }
-
     def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
             name="cfn-lint-validator",
@@ -477,9 +471,7 @@ class CheckovValidatorSkill(Skill):
     RemediationSkill reads check_id and calls
     checkov_context.get_checkov_policy_context() to look up the Checkov source
     code from Data/checkov_cfn_policy_map.csv, then appends it to the LLM
-    remediation prompt.  No changes to this skill are required — check_id is
-    already populated by _check_to_finding() and the remediation_hint is
-    augmented below to surface the inspected CFN property path.
+    remediation prompt.
     """
 
     def _define_metadata(self) -> SkillMetadata:
@@ -520,6 +512,10 @@ class CheckovValidatorSkill(Skill):
         self._runtime_initialized = True
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
+        backend = str(god.template.metadata.get("validator_backend", "checkov")).strip().lower()
+        if backend != "checkov":
+            return False
+
         # Accept cfn_lint=ERROR (tool absent) as equivalent to PASS so the
         # chain does not stall when cfn-lint is not installed.
         return (
@@ -695,5 +691,201 @@ class CheckovValidatorSkill(Skill):
             return f"checkov-{match.group(1)}"
         match = re.search(r"version\s+(\d[\d.]+)", stderr, re.I)
         return f"checkov-{match.group(1)}" if match else "checkov-unknown"
+
+
+# =============================================================================
+# 4. TRIVY VALIDATOR
+# =============================================================================
+
+class TrivyValidatorSkill(Skill):
+    """
+    Validates security best practices using Trivy config scanning.
+
+    Gate: cfn_lint must be PASS **or ERROR** (missing cfn-lint tool is treated
+    as skipped — the pipeline must not stall here).
+    Install: brew install trivy  (or)  pipx/pipeline-managed binary
+    """
+
+    def _define_metadata(self) -> SkillMetadata:
+        return SkillMetadata(
+            name="trivy-validator",
+            version="1.0.0",
+            description="Validates security best practices using Trivy config scan.",
+            llm_description=(
+                "Runs Trivy config scan against the CloudFormation template. "
+                "Maps Trivy misconfiguration results to ValidationFinding using "
+                "Trivy-provided severity values."
+            ),
+            phase=SkillPhase.VALIDATION,
+            trigger_condition=(
+                "validation_state.cfn_lint is PASS or ERROR "
+                "AND validation_state.trivy is PENDING"
+            ),
+            writes_to=["validation_state.trivy"],
+            reads_from=["template.body"],
+            priority=30,
+            tags=["static", "security", "trivy"],
+        )
+
+    def _ensure_runtime(self):
+        if getattr(self, "_runtime_initialized", False):
+            return
+
+        import shutil as _shutil
+        import subprocess as _subprocess
+        import json as _json
+        self._shutil = _shutil
+        self._subprocess = _subprocess
+        self._json = _json
+        self._runtime_initialized = True
+
+    def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
+        backend = str(god.template.metadata.get("validator_backend", "checkov")).strip().lower()
+        if backend != "trivy":
+            return False
+
+        return (
+            god.validation_state["cfn_lint"].status in _PASS_OR_ERROR
+            and god.validation_state["trivy"].status == ValidationStatus.PENDING
+        )
+
+    def execute(self, context: SkillContext) -> SkillResult:
+        self._ensure_runtime()
+        god = context.god
+        skill_result = SkillResult(success=True, skill_name=self.metadata.name)
+
+        vr = ValidationResult(validator_name="trivy")
+        vr.started_at = datetime.now().isoformat()
+
+        trivy_bin = self._shutil.which("trivy")
+        if trivy_bin is None:
+            self._logger.error("trivy not found on PATH. Install: brew install trivy")
+            vr.status = ValidationStatus.ERROR
+            vr.errors = ["trivy not installed. Run: brew install trivy"]
+            vr.completed_at = datetime.now().isoformat()
+            god.set_validation_result("trivy", vr, self.metadata.name)
+            skill_result.success = False
+            return skill_result
+
+        tmp_dir = tempfile.mkdtemp(prefix="trivy_skill_")
+        template_path = os.path.join(tmp_dir, "template.yaml")
+
+        try:
+            with open(template_path, "w", encoding="utf-8") as fh:
+                fh.write(god.template.body)
+
+            cmd = [
+                trivy_bin,
+                "config",
+                "--format", "json",
+                "--quiet",
+                template_path,
+            ]
+            self._logger.info(f"Running: {' '.join(cmd)}")
+
+            proc = self._subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=context.config.get("trivy_timeout_seconds", 120),
+            )
+
+            raw_stdout = proc.stdout.strip()
+            raw_stderr = proc.stderr.strip()
+            vr.raw_output = raw_stdout[:4000]
+            vr.tool_version = self._extract_version(raw_stderr)
+
+            # Trivy uses non-zero exit codes for policy findings; parse output
+            # unless the process itself failed hard.
+            if proc.returncode not in (0, 1):
+                raise RuntimeError(f"Trivy process error (exit {proc.returncode}): {raw_stderr[:300]}")
+
+            findings = self._parse_trivy_output(raw_stdout)
+            vr.findings = findings
+
+            blocking = [f for f in findings if f.severity in (Severity.CRITICAL, Severity.HIGH)]
+            if blocking:
+                vr.status = ValidationStatus.FAIL
+                skill_result.success = False
+                skill_result.errors.append(f"{len(blocking)} critical/high security findings")
+            else:
+                vr.status = ValidationStatus.PASS
+                skill_result.changes_made.append(
+                    f"Security validated by Trivy ({len(findings)} low/medium findings)"
+                )
+
+        except self._subprocess.TimeoutExpired:
+            vr.status = ValidationStatus.ERROR
+            vr.errors = ["Trivy timed out"]
+            skill_result.success = False
+        except Exception as exc:
+            vr.status = ValidationStatus.ERROR
+            vr.errors = [str(exc)]
+            skill_result.success = False
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        vr.completed_at = datetime.now().isoformat()
+        god.set_validation_result("trivy", vr, self.metadata.name)
+        return skill_result
+
+    def _parse_trivy_output(self, raw: str) -> list[ValidationFinding]:
+        findings: list[ValidationFinding] = []
+        if not raw:
+            return findings
+
+        try:
+            data = self._json.loads(raw)
+        except self._json.JSONDecodeError:
+            return findings
+
+        results = data.get("Results", []) if isinstance(data, dict) else []
+        for result in results:
+            misconfigs = result.get("Misconfigurations", []) or []
+            target = result.get("Target", "")
+            for mis in misconfigs:
+                check_id = mis.get("AVDID") or mis.get("ID") or "UNKNOWN"
+                rule_id = check_id
+                severity = self._severity_from_log(mis.get("Severity", ""))
+                title = mis.get("Title") or mis.get("Message") or mis.get("Description") or rule_id
+                cause_meta = mis.get("CauseMetadata", {}) if isinstance(mis.get("CauseMetadata"), dict) else {}
+                resource_name = (
+                    cause_meta.get("Resource")
+                    or cause_meta.get("ResourceName")
+                    or target
+                    or "(template)"
+                )
+                resource_type = cause_meta.get("Type") or "Template"
+                line_number = cause_meta.get("StartLine") or 0
+
+                findings.append(ValidationFinding(
+                    rule_id=rule_id,
+                    resource_name=str(resource_name),
+                    resource_type=str(resource_type),
+                    severity=severity,
+                    message=str(title),
+                    check_id=str(check_id),
+                    file_path=str(target),
+                    line_number=int(line_number) if isinstance(line_number, int) else 0,
+                ))
+
+        return findings
+
+    @staticmethod
+    def _severity_from_log(raw_value: str) -> Severity:
+        value = (raw_value or "").strip().upper()
+        if value in Severity.__members__:
+            return Severity[value]
+        if value in {"UNKNOWN", "UNSPECIFIED"}:
+            return Severity.MEDIUM
+        return Severity.MEDIUM
+
+    @staticmethod
+    def _extract_version(stderr: str) -> str:
+        import re
+        match = re.search(r"Version:\s*v?(\d+\.\d+\.\d+)", stderr, re.I)
+        if match:
+            return f"trivy-{match.group(1)}"
+        return "trivy-unknown"
 
 
