@@ -82,6 +82,7 @@ class OpenRouterClient:
         user: str,
         temperature: float = 0.2,
         timeout: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
     ) -> LLMResponse:
         """
         Make an LLM request and return a structured LLMResponse.
@@ -95,14 +96,18 @@ class OpenRouterClient:
         """
         effective_timeout = timeout if timeout is not None else self.default_timeout
 
-        payload = json.dumps({
+        payload_data = {
             "model": self.model,
             "temperature": temperature,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
             ],
-        }).encode()
+        }
+        if max_output_tokens is not None:
+            payload_data["max_tokens"] = max_output_tokens
+
+        payload = json.dumps(payload_data).encode()
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -177,9 +182,12 @@ class OpenRouterClient:
         user: str,
         temperature: float = 0.2,
         timeout: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
     ) -> str:
         """Backward-compatible wrapper: returns only the text content."""
         return self.call(
             system=system, user=user,
-            temperature=temperature, timeout=timeout,
+            temperature=temperature,
+            timeout=timeout,
+            max_output_tokens=max_output_tokens,
         ).content

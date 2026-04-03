@@ -5,11 +5,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Optional
 
 from enums import Severity, ValidationStatus
 
@@ -91,115 +90,28 @@ class ValidationResult:
 
 
 @dataclass
-class AcceptanceCriterion:
-    """A single acceptance criterion"""
-    id: str
+class GroundedObjective:
+    """Single source of truth objective for planning and engineering."""
     description: str
-    resource_type: Optional[str] = None
-    property_path: Optional[str] = None
-    expected_value: Any = None
-    check_type: str = "exists"
-    is_met: Optional[bool] = None
-    failure_reason: str = ""
 
     def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "description": self.description,
-            "resource_type": self.resource_type,
-            "property_path": self.property_path,
-            "check_type": self.check_type,
-            "is_met": self.is_met,
-            "failure_reason": self.failure_reason,
-        }
-
-
-@dataclass
-class ExtractedResource:
-    """A resource extracted from user intent"""
-    resource_type: str
-    logical_name: str
-    priority: int = 100
-    dependencies: list[str] = field(default_factory=list)
-    properties_hints: dict = field(default_factory=dict)
-    generated: bool = False
-
-    def to_dict(self) -> dict:
-        return {
-            "resource_type": self.resource_type,
-            "logical_name": self.logical_name,
-            "priority": self.priority,
-            "dependencies": self.dependencies,
-            "generated": self.generated,
-        }
-
-
-@dataclass
-class Constraints:
-    """Infrastructure constraints extracted from user intent"""
-    multi_az: bool = False
-    encryption_at_rest: bool = True
-    encryption_in_transit: bool = True
-    public_access_allowed: bool = False
-    compliance_frameworks: list[str] = field(default_factory=list)
-    environment: str = "production"
-    backup_enabled: bool = True
-    backup_retention_days: int = 7
-    logging_enabled: bool = True
-    monitoring_enabled: bool = True
-    cost_optimization: bool = False
-
-    def to_dict(self) -> dict:
-        return {
-            "multi_az": self.multi_az,
-            "encryption_at_rest": self.encryption_at_rest,
-            "encryption_in_transit": self.encryption_in_transit,
-            "public_access_allowed": self.public_access_allowed,
-            "compliance_frameworks": self.compliance_frameworks,
-            "environment": self.environment,
-            "backup_enabled": self.backup_enabled,
-            "logging_enabled": self.logging_enabled,
-        }
-
-    def is_production(self) -> bool:
-        return self.environment.lower() in ["production", "prod"]
+        return {"description": self.description}
 
 
 @dataclass
 class Intent:
     """The intent section of the GOD"""
     raw_prompt: str = ""
-    normalized_prompt: str = ""
-    resources: list[ExtractedResource] = field(default_factory=list)
-    constraints: Constraints = field(default_factory=Constraints)
-    acceptance_criteria: list[AcceptanceCriterion] = field(default_factory=list)
+    objectives: list[GroundedObjective] = field(default_factory=list)
     parsed_at: Optional[str] = None
     parser_version: str = ""
 
     def to_dict(self) -> dict:
         return {
-            "raw_prompt": (
-                self.raw_prompt[:200] + "..."
-                if len(self.raw_prompt) > 200
-                else self.raw_prompt
-            ),
-            "resources": [r.to_dict() for r in self.resources],
-            "resource_count": len(self.resources),
-            "constraints": self.constraints.to_dict(),
-            "acceptance_criteria_count": len(self.acceptance_criteria),
+            "prompt": self.raw_prompt,
+            "objectives": [o.to_dict() for o in self.objectives],
             "parsed_at": self.parsed_at,
         }
-
-    def get_resource_types(self) -> set[str]:
-        return {r.resource_type for r in self.resources}
-
-    def get_ungenerated_resources(self) -> list[ExtractedResource]:
-        return [r for r in self.resources if not r.generated]
-
-    def mark_resource_generated(self, resource_type: str):
-        for r in self.resources:
-            if r.resource_type == resource_type:
-                r.generated = True
 
 
 @dataclass
@@ -215,6 +127,7 @@ class Template:
     outputs: dict[str, dict] = field(default_factory=dict)
     metadata: dict = field(default_factory=dict)
     checksum: str = ""
+    previous_body: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -223,6 +136,7 @@ class Template:
             "last_modified_by": self.last_modified_by,
             "last_modified_at": self.last_modified_at,
             "body_length": len(self.body),
+            "previous_body_length": len(self.previous_body),
             "resource_blocks": list(self.resources.keys()),
             "checksum": self.checksum,
         }
@@ -308,7 +222,6 @@ class GroundedObjectivesDocument:
         "yaml_syntax",
         "cfn_lint",
         "checkov",
-        "intent_alignment",
     ]
 
     def __init__(self):
@@ -587,4 +500,34 @@ class GroundedObjectivesDocument:
                 k: v.to_dict() for k, v in self.validation_state.items()
             },
             "remediation_log": [e.to_dict() for e in self.remediation_log],
+        }
+
+    def llm_context(self) -> dict:
+        """
+        Compact context for LLM skills.
+
+        Keeps only fields that materially affect template synthesis/fixing so
+        prompt payloads stay small enough to avoid truncation in normal runs.
+        """
+        objective_descriptions = [o.description for o in self.intent.objectives]
+        remediation_history = [
+            {
+                "round": e.round,
+                "action_type": e.action_type,
+                "strategy_type": e.strategy_type,
+                "description": e.description,
+                "findings_addressed": e.findings_addressed,
+            }
+            for e in self.remediation_log[-8:]
+        ]
+        return {
+            "prompt": self.intent.raw_prompt,
+            "objectives": objective_descriptions,
+            "template_context": {
+                "has_current_body": bool(self.template.body),
+                "has_previous_body": bool(self.template.previous_body),
+                "current_body_length": len(self.template.body),
+                "previous_body_length": len(self.template.previous_body),
+            },
+            "remediation_history": remediation_history,
         }

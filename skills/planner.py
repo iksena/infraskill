@@ -7,8 +7,8 @@ import json
 import time
 from typing import Optional
 
-from enums import Severity, SkillPhase, ValidationStatus
-from god import AcceptanceCriterion, Constraints, ExtractedResource, GroundedObjectivesDocument
+from enums import SkillPhase
+from god import GroundedObjective, GroundedObjectivesDocument
 from llm_client import OpenRouterClient
 from prompt import PLANNER_SYSTEM_PROMPT
 from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
@@ -17,61 +17,41 @@ from telemetry import TelemetryRecorder
 
 class PlannerSkill(Skill):
     """
-    Transforms a natural-language infrastructure prompt into a machine-checkable
-    GOD specification: resource list, constraints, and acceptance criteria.
+    Transforms a natural-language infrastructure prompt into a compact,
+    objectives-only GOD specification.
     """
 
     def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
             name="planner",
-            version="3.1.0",
+            version="3.4.0",
             description=(
                 "Transforms a natural-language infrastructure prompt into a "
-                "machine-checkable GOD specification: resource list, constraints, "
-                "and acceptance criteria."
+                "compact GOD specification with prompt and grounded objectives "
+                "as the single source of truth."
             ),
             llm_description=(
                 "Given a natural-language prompt describing desired cloud "
-                "infrastructure, extract: (1) the list of AWS resources needed, "
-                "(2) constraints such as security, HA, compliance, and (3) "
-                "binary acceptance criteria that can be checked against the "
-                "generated CloudFormation template."
+                "infrastructure, extract a concise list of grounded objectives "
+                "that are actionable for template generation and validation."
             ),
             phase=SkillPhase.PLANNING,
             trigger_condition=(
-                "intent.raw_prompt exists AND (intent.resources is empty OR "
-                "intent_alignment has blocking findings)"
+                "intent.raw_prompt exists AND intent.objectives is empty"
             ),
             writes_to=[
-                "intent.resources",
-                "intent.constraints",
-                "intent.acceptance_criteria",
-                "intent.normalized_prompt",
+                "intent.objectives",
                 "intent.parsed_at",
                 "intent.parser_version",
                 "template.body (cleared only during re-plan)",
             ],
             reads_from=["intent.raw_prompt"],
             priority=10,
-            tags=["llm", "planning", "extraction"],
+            tags=["llm", "planning", "objectives"],
         )
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
-        if not god.intent.raw_prompt:
-            return False
-        if not god.intent.resources:
-            return True
-
-        intent_validation = god.validation_state.get("intent_alignment")
-        if not intent_validation:
-            return False
-        if intent_validation.status != ValidationStatus.FAIL:
-            return False
-
-        return any(
-            f.severity in (Severity.CRITICAL, Severity.HIGH)
-            for f in intent_validation.findings
-        )
+        return bool(god.intent.raw_prompt) and not bool(god.intent.objectives)
 
     # ------------------------------------------------------------------
     # Main execute
@@ -87,7 +67,7 @@ class PlannerSkill(Skill):
             return SkillResult.failure(
                 self.metadata.name,
                 "No LLM client configured. PlannerSkill requires an LLM to extract "
-                "resources and acceptance criteria from the prompt.",
+                "objectives from the prompt.",
             )
 
         remediation_hints = getattr(god.template, "remediation_hints", "") or ""
@@ -149,36 +129,17 @@ class PlannerSkill(Skill):
             )
 
         is_replan = bool(god.template.body)
-        before_resources = list(god.intent.resources) if god.intent.resources else []
+        before_objectives = list(god.intent.objectives) if god.intent.objectives else []
         before_template_body = god.template.body
-        god.intent.resources = [ExtractedResource(**r) for r in data["resources"]]
-        god.intent.constraints = Constraints(**data["constraints"])
-        god.intent.acceptance_criteria = [
-            AcceptanceCriterion(**c) for c in data["acceptance_criteria"]
-        ]
-        god.intent.normalized_prompt = god.intent.raw_prompt.lower()
+        god.intent.objectives = self._parse_objectives(data.get("objectives", []))
         god.intent.parsed_at = datetime.now().isoformat()
         god.intent.parser_version = self.metadata.version
 
         if tel:
             tel.record_god_change(
-                field="intent.resources",
-                before=before_resources,
-                after=[r.resource_type for r in god.intent.resources],
-                changed_by=self.metadata.name,
-                iteration=iteration,
-            )
-            tel.record_god_change(
-                field="intent.constraints",
-                before=None,
-                after=str(god.intent.constraints),
-                changed_by=self.metadata.name,
-                iteration=iteration,
-            )
-            tel.record_god_change(
-                field="intent.acceptance_criteria",
-                before=[],
-                after=[str(c) for c in god.intent.acceptance_criteria],
+                field="intent.objectives",
+                before=[o.description for o in before_objectives],
+                after=[o.description for o in god.intent.objectives],
                 changed_by=self.metadata.name,
                 iteration=iteration,
             )
@@ -200,11 +161,26 @@ class PlannerSkill(Skill):
                 "Detected intent drift findings; cleared template to force regeneration"
             )
 
-        result.changes_made.append(
-            f"LLM extracted {len(god.intent.resources)} resources, "
-            f"{len(god.intent.acceptance_criteria)} acceptance criteria"
-        )
+        result.changes_made.append(f"LLM extracted {len(god.intent.objectives)} grounded objectives")
         return result
+
+    @staticmethod
+    def _parse_objectives(raw_objectives: list) -> list[GroundedObjective]:
+        """
+        Accepts either the new compact schema (list[str]) or legacy object
+        schema and normalizes both to description-only objectives.
+        """
+        parsed: list[GroundedObjective] = []
+        for item in raw_objectives:
+            if isinstance(item, str):
+                desc = item.strip()
+            elif isinstance(item, dict):
+                desc = str(item.get("description", "")).strip()
+            else:
+                desc = ""
+            if desc:
+                parsed.append(GroundedObjective(description=desc))
+        return parsed
 
     # ------------------------------------------------------------------
     # JSON parse with single correction retry

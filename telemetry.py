@@ -69,7 +69,7 @@ class TelemetryRecorder:
         "run_id", "started_at", "finished_at", "prompt_snippet",
         "final_state", "iterations", "duration_ms", "remediation_rounds",
         "llm_calls", "total_prompt_tokens", "total_response_tokens",
-        "yaml_syntax", "cfn_lint", "checkov", "intent_alignment",
+        "yaml_syntax", "cfn_lint", "checkov",
     ]
 
     def __init__(self, base_dir: str = "telemetry"):
@@ -356,7 +356,6 @@ class TelemetryRecorder:
                 "yaml_syntax": validation_summary.get("yaml_syntax", "N/A"),
                 "cfn_lint": validation_summary.get("cfn_lint", "N/A"),
                 "checkov": validation_summary.get("checkov", "N/A"),
-                "intent_alignment": validation_summary.get("intent_alignment", "N/A"),
             })
 
     # ------------------------------------------------------------------

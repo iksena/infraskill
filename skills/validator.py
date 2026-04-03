@@ -6,7 +6,6 @@
 #   10  YAMLSyntaxValidatorSkill   — pure Python, always fast
 #   20  CFNLintValidatorSkill      — real cfn-lint CLI (no hand-rolled schemas)
 #   30  CheckovValidatorSkill      — real Checkov CLI (unchanged)
-#   40  IntentAlignmentValidatorSkill — LLM scoring (accuracy + coverage)
 #
 # Gate semantics for can_trigger()
 # ---------------------------------
@@ -16,13 +15,12 @@
 #
 # Checkov → Remediation policy context
 # ---------------------------------------
-# CheckovValidatorSkill populates ValidationFinding.check_id for every failed
-# CKV_* check.  RemediationSkill uses checkov_context.get_checkov_policy_context()
+# CheckovValidatorSkill records the raw Checkov result fields and check_id for
+# each failed check.  RemediationSkill uses checkov_context.get_checkov_policy_context()
 # to look up the Checkov source code for each failing check_id from
 # Data/checkov_cfn_policy_map.csv and appends it to the LLM fix prompt.
-# This mirrors the generate_security_remediation_feedback pattern in IaCGen
-# (Code/main.py) so the LLM sees the exact scan_resource_conf() logic and
-# knows precisely which CFN property path to fix.
+# The validator itself does not synthesize remediation hints or infer policy
+# meaning from the rule id.
 #
 # Runtime loading:
 #   Heavy imports (yaml, subprocess, shutil, json, re) are initialized lazily
@@ -413,8 +411,15 @@ class CFNLintValidatorSkill(Skill):
             rule = match.get("Rule", {})
             rule_id = rule.get("Id", "UNKNOWN")
             message = match.get("Message", "")
-            first_char = rule_id[0].upper() if rule_id else "W"
-            severity = self._SEVERITY_MAP.get(first_char, Severity.MEDIUM)
+            severity_text = (
+                match.get("Level")
+                or match.get("level")
+                or match.get("Severity")
+                or rule.get("Level")
+                or rule.get("Severity")
+                or ""
+            )
+            severity = self._severity_from_log(severity_text)
             location = match.get("Location", {}) or {}
             path_obj = location.get("Path", {}) if isinstance(location, dict) else {}
             cfn_path = path_obj.get("CfnPath", []) if isinstance(path_obj, dict) else []
@@ -428,7 +433,6 @@ class CFNLintValidatorSkill(Skill):
                 resource_type=resource_type,
                 severity=severity,
                 message=message,
-                remediation_hint=rule.get("ShortDescription", ""),
                 line_number=line_number,
             ))
 
@@ -442,6 +446,17 @@ class CFNLintValidatorSkill(Skill):
             return f"cfn-lint-{match.group(1)}"
         match = re.search(r"version\s+(\d[\d.]+)", stderr, re.I)
         return f"cfn-lint-{match.group(1)}" if match else "cfn-lint-unknown"
+
+    @staticmethod
+    def _severity_from_log(raw_value: str) -> Severity:
+        value = (raw_value or "").strip().upper()
+        if value in {"ERROR", "CRITICAL", "HIGH"}:
+            return Severity.CRITICAL if value == "ERROR" else Severity[value]
+        if value in {"WARNING", "WARN"}:
+            return Severity.HIGH
+        if value == "INFO":
+            return Severity.INFO
+        return Severity.MEDIUM
 
 
 # =============================================================================
@@ -466,22 +481,6 @@ class CheckovValidatorSkill(Skill):
     already populated by _check_to_finding() and the remediation_hint is
     augmented below to surface the inspected CFN property path.
     """
-
-    _SEVERITY_MAP: dict[str, Severity] = {
-        "CRITICAL": Severity.CRITICAL,
-        "HIGH":     Severity.HIGH,
-        "MEDIUM":   Severity.MEDIUM,
-        "LOW":      Severity.LOW,
-        "INFO":     Severity.INFO,
-    }
-    _CHECK_SEVERITY_FALLBACK: dict[str, Severity] = {
-        "CKV_AWS_17": Severity.CRITICAL,
-        "CKV_AWS_19": Severity.CRITICAL,
-        "CKV_AWS_24": Severity.CRITICAL,
-        "CKV_AWS_25": Severity.CRITICAL,
-        "CKV_AWS_18": Severity.HIGH,
-        "CKV_AWS_16": Severity.HIGH,
-    }
 
     def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
@@ -657,23 +656,8 @@ class CheckovValidatorSkill(Skill):
             raw_resource.rsplit(".", 1) if "." in raw_resource
             else (raw_resource, raw_resource)
         )
-        sev_str = (check.get("severity") or "").upper()
-        severity = (
-            self._SEVERITY_MAP.get(sev_str)
-            or self._CHECK_SEVERITY_FALLBACK.get(check_id)
-            or Severity.MEDIUM
-        )
+        severity = self._severity_from_log(check.get("severity", ""))
         line_range = check.get("file_line_range", [0, 0])
-        guideline = check.get("guideline", "")
-        evaluated_keys = check.get("check_result", {}).get("evaluated_keys", [])
-        # Surface the evaluated CFN property path in the hint so that even
-        # without the full policy context the LLM has a concrete target.
-        property_hint = (
-            "Fix CFN property path(s): " + ", ".join(str(k) for k in evaluated_keys[:5])
-            if evaluated_keys else ""
-        )
-        remediation_parts = [p for p in [property_hint, guideline] if p]
-        remediation = " | ".join(remediation_parts)
 
         return ValidationFinding(
             rule_id=check_id,
@@ -681,11 +665,27 @@ class CheckovValidatorSkill(Skill):
             resource_type=resource_type,
             severity=severity,
             message=check_name,
-            remediation_hint=remediation,
             check_id=check_id,
             file_path=check.get("file_path", ""),
             line_number=line_range[0] if line_range else 0,
         )
+
+    @staticmethod
+    def _severity_from_log(raw_value: str) -> Severity:
+        value = (raw_value or "").strip().upper()
+        if value in Severity.__members__:
+            return Severity[value]
+        if value in {"ERROR", "CRITICAL"}:
+            return Severity.CRITICAL
+        if value in {"HIGH"}:
+            return Severity.HIGH
+        if value in {"LOW"}:
+            return Severity.LOW
+        if value in {"INFO"}:
+            return Severity.INFO
+        if value in {"WARNING", "WARN"}:
+            return Severity.HIGH
+        return Severity.MEDIUM
 
     @staticmethod
     def _extract_version(stderr: str) -> str:
@@ -697,278 +697,3 @@ class CheckovValidatorSkill(Skill):
         return f"checkov-{match.group(1)}" if match else "checkov-unknown"
 
 
-# =============================================================================
-# 4. INTENT ALIGNMENT VALIDATOR
-# =============================================================================
-
-_INTENT_ALIGNMENT_PROMPT = """
-You are an expert AWS CloudFormation reviewer.
-You will be given:
-  1. The original user intent (what infrastructure was requested)
-  2. The list of acceptance criteria that the template must satisfy
-  3. The full generated CloudFormation YAML template
-
-Your job is to evaluate the template on TWO dimensions:
-
-## Dimension 1 — Accuracy
-Does each resource that IS present match the user's intent?
-- Wrong resource type for the stated goal
-- Incorrect property values (e.g. wrong engine, wrong runtime)
-- Missing critical properties implied by the intent
-
-## Dimension 2 — Coverage
-Are ALL resources and requirements from the intent present in the template?
-- Missing resources (user asked for X but X is absent)
-- Missing acceptance criteria fulfilment
-
-Return a JSON object ONLY (no prose, no markdown fences) with this exact schema:
-{
-  "accuracy_score": <float 0.0-1.0>,
-  "coverage_score": <float 0.0-1.0>,
-  "accuracy_findings": [
-    {
-      "criterion_id": "AC-N or ACCURACY-N",
-      "resource_type": "AWS::...",
-      "resource_name": "LogicalName",
-      "severity": "CRITICAL|HIGH|MEDIUM|LOW",
-      "message": "<what is wrong>",
-      "remediation_hint": "<how to fix>"
-    }
-  ],
-  "coverage_findings": [
-    {
-      "criterion_id": "COVERAGE-N",
-      "resource_type": "AWS::... or empty string",
-      "resource_name": "(missing) or LogicalName",
-      "severity": "CRITICAL|HIGH|MEDIUM|LOW",
-      "message": "<what is missing>",
-      "remediation_hint": "<how to fix>"
-    }
-  ],
-  "overall_pass": <true if accuracy_score >= 0.8 AND coverage_score >= 0.8 else false>
-}
-"""
-
-
-class IntentAlignmentValidatorSkill(Skill):
-    """
-    Validates that the generated template satisfies the user's original intent
-    using an LLM-based two-dimensional scoring approach.
-
-    Gate: checkov must be PASS **or ERROR** (missing checkov tool is treated
-    as skipped — the pipeline must not stall here).
-
-    Dimensions
-    ----------
-    Accuracy  — each resource present in the template is correct and complete
-    Coverage  — all resources / requirements from the intent are present
-
-    Pass threshold: accuracy_score >= 0.8 AND coverage_score >= 0.8.
-    """
-
-    def _define_metadata(self) -> SkillMetadata:
-        return SkillMetadata(
-            name="intent-validator",
-            version="2.0.0",
-            description=(
-                "LLM-based validator that scores the generated template on "
-                "accuracy (resources are correct) and coverage (all intent "
-                "requirements are present)."
-            ),
-            llm_description=(
-                "Sends the user intent, acceptance criteria, and the full "
-                "CloudFormation template to the LLM for structured evaluation. "
-                "Returns per-finding details and pass/fail scores on accuracy "
-                "and coverage dimensions."
-            ),
-            phase=SkillPhase.VALIDATION,
-            trigger_condition=(
-                "validation_state.checkov is PASS or ERROR "
-                "AND validation_state.intent_alignment is PENDING"
-            ),
-            writes_to=["validation_state.intent_alignment"],
-            reads_from=[
-                "template.body",
-                "intent.raw_prompt",
-                "intent.acceptance_criteria",
-                "intent.resources",
-            ],
-            priority=40,
-            tags=["llm", "intent", "accuracy", "coverage"],
-        )
-
-    def _ensure_runtime(self):
-        if getattr(self, "_runtime_initialized", False):
-            return
-        import json as _json
-        self._json = _json
-        self._runtime_initialized = True
-
-    def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
-        # Accept checkov=ERROR (tool absent) as equivalent to PASS.
-        return (
-            god.validation_state["checkov"].status in _PASS_OR_ERROR
-            and god.validation_state["intent_alignment"].status == ValidationStatus.PENDING
-        )
-
-    def execute(self, context: SkillContext) -> SkillResult:
-        self._ensure_runtime()
-        god = context.god
-        skill_result = SkillResult(success=True, skill_name=self.metadata.name)
-
-        vr = ValidationResult(validator_name="intent_alignment")
-        vr.started_at = datetime.now().isoformat()
-
-        from llm_client import OpenRouterClient
-        llm: OpenRouterClient | None = context.get_config("llm")
-
-        if llm is None:
-            self._logger.warning(
-                "No LLM client; falling back to structural intent check."
-            )
-            return self._fallback_structural_check(god, vr, skill_result)
-
-        threshold: float = context.config.get("intent_pass_threshold", 0.8)
-
-        criteria_text = "\n".join(
-            f"  [{c.id}] {c.description}"
-            for c in god.intent.acceptance_criteria
-        )
-        resources_text = "\n".join(
-            f"  - {r.resource_type} ({r.logical_name})"
-            for r in god.intent.resources
-        )
-
-        user_message = (
-            f"## User Intent\n{god.intent.raw_prompt}\n\n"
-            f"## Expected Resources\n{resources_text}\n\n"
-            f"## Acceptance Criteria\n{criteria_text}\n\n"
-            f"## Generated CloudFormation Template\n```yaml\n{god.template.body}\n```"
-        )
-
-        try:
-            raw = llm.complete(
-                system=_INTENT_ALIGNMENT_PROMPT,
-                user=user_message,
-                temperature=0.0,
-            )
-
-            import re as _re
-            raw_clean = _re.sub(r'^```[\w]*\n?|\n?```$', '', raw.strip(), flags=_re.MULTILINE)
-            data: dict = self._json.loads(raw_clean)
-
-        except self._json.JSONDecodeError as exc:
-            self._logger.warning(
-                f"LLM returned non-JSON intent evaluation ({exc}); "
-                "falling back to structural check."
-            )
-            return self._fallback_structural_check(god, vr, skill_result)
-        except Exception as exc:
-            vr.status = ValidationStatus.ERROR
-            vr.errors = [f"LLM intent evaluation error: {exc}"]
-            vr.completed_at = datetime.now().isoformat()
-            god.set_validation_result("intent_alignment", vr, self.metadata.name)
-            skill_result.success = False
-            return skill_result
-
-        accuracy_score: float = float(data.get("accuracy_score", 0.0))
-        coverage_score: float = float(data.get("coverage_score", 0.0))
-        overall_pass: bool = data.get("overall_pass", False)
-
-        vr.metrics = {
-            "accuracy_score": accuracy_score,
-            "coverage_score": coverage_score,
-        }
-
-        findings: list[ValidationFinding] = []
-        for raw_f in data.get("accuracy_findings", []) + data.get("coverage_findings", []):
-            sev_str = (raw_f.get("severity") or "HIGH").upper()
-            sev_map = {
-                "CRITICAL": Severity.CRITICAL,
-                "HIGH": Severity.HIGH,
-                "MEDIUM": Severity.MEDIUM,
-                "LOW": Severity.LOW,
-            }
-            findings.append(ValidationFinding(
-                rule_id=raw_f.get("criterion_id", "INTENT"),
-                resource_name=raw_f.get("resource_name", "(template)"),
-                resource_type=raw_f.get("resource_type", "Template"),
-                severity=sev_map.get(sev_str, Severity.HIGH),
-                message=raw_f.get("message", ""),
-                remediation_hint=raw_f.get("remediation_hint", ""),
-            ))
-        vr.findings = findings
-
-        finding_criterion_ids = {
-            f.rule_id for f in findings if f.severity in (Severity.CRITICAL, Severity.HIGH)
-        }
-        for criterion in god.intent.acceptance_criteria:
-            criterion.is_met = criterion.id not in finding_criterion_ids
-
-        if overall_pass and accuracy_score >= threshold and coverage_score >= threshold:
-            vr.status = ValidationStatus.PASS
-            skill_result.changes_made.append(
-                f"Intent validated — accuracy={accuracy_score:.2f}, "
-                f"coverage={coverage_score:.2f}"
-            )
-        else:
-            vr.status = ValidationStatus.FAIL
-            skill_result.success = False
-            skill_result.errors.append(
-                f"Intent misalignment: accuracy={accuracy_score:.2f} "
-                f"coverage={coverage_score:.2f} "
-                f"(threshold={threshold}) — "
-                f"{len(findings)} finding(s)"
-            )
-
-        vr.completed_at = datetime.now().isoformat()
-        god.set_validation_result("intent_alignment", vr, self.metadata.name)
-        return skill_result
-
-    def _fallback_structural_check(
-        self,
-        god: GroundedObjectivesDocument,
-        vr: ValidationResult,
-        skill_result: SkillResult,
-    ) -> SkillResult:
-        try:
-            template = cfn_safe_load(god.template.body)
-        except Exception as exc:
-            vr.status = ValidationStatus.ERROR
-            vr.errors = [f"Cannot parse template for structural check: {exc}"]
-            vr.completed_at = datetime.now().isoformat()
-            god.set_validation_result("intent_alignment", vr, self.metadata.name)
-            skill_result.success = False
-            return skill_result
-
-        resources = template.get("Resources", {})
-        present_types = {r.get("Type") for r in resources.values()}
-        findings: list[ValidationFinding] = []
-
-        for expected in god.intent.resources:
-            if expected.resource_type not in present_types:
-                findings.append(ValidationFinding(
-                    rule_id="COVERAGE-MISSING",
-                    resource_name=expected.logical_name,
-                    resource_type=expected.resource_type,
-                    severity=Severity.HIGH,
-                    message=f"Expected resource type {expected.resource_type} not found in template",
-                    remediation_hint=f"Add an {expected.resource_type} resource to the template",
-                ))
-
-        vr.findings = findings
-        if findings:
-            vr.status = ValidationStatus.FAIL
-            skill_result.success = False
-            skill_result.errors.append(
-                f"{len(findings)} missing resource type(s) in structural check"
-            )
-        else:
-            vr.status = ValidationStatus.PASS
-            skill_result.changes_made.append(
-                "Structural intent check passed (LLM not available)"
-            )
-
-        vr.completed_at = datetime.now().isoformat()
-        god.set_validation_result("intent_alignment", vr, self.metadata.name)
-        return skill_result

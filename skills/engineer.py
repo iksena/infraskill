@@ -1,14 +1,9 @@
 # -----------------------------------------------------------------------------
-# ENGINEERING SKILL  v2.2.0  — full GOD context in every LLM call
+# ENGINEERING SKILL  v2.3.0  — compact grounded-objectives context
 # -----------------------------------------------------------------------------
-# Changes from v2.1.0:
-#   - acceptance_criteria and remediation_hints are now injected into the
-#     system prompt so the LLM has the full GOD picture on first generation
-#     and on every re-plan round.
-#   - god_snapshot is serialised as JSON and appended to the user message
-#     so the LLM can cross-reference resource types, constraints, and AC.
-#   - record_god_change now fired even when before_body is empty so the
-#     llm_conversations and god_changes logs are always in sync.
+# Changes from v2.2.0:
+#   - uses god.llm_context() instead of full god.snapshot() to keep LLM payload
+#     compact and reduce truncation pressure on objectives.
 # -----------------------------------------------------------------------------
 
 import json
@@ -35,26 +30,24 @@ class GeneralEngineerSkill(Skill):
     def _define_metadata(self) -> SkillMetadata:
         return SkillMetadata(
             name="general-engineer",
-            version="2.2.0",
+            version="2.4.0",
             description=(
                 "Generates a complete AWS CloudFormation template from the GOD "
                 "specification in a single LLM call."
             ),
             llm_description=(
-                "Given a full infrastructure specification (resources, constraints, "
-                "acceptance criteria, remediation hints), produce a complete, "
+                "Given prompt + grounded objectives + remediation hints, produce a complete, "
                 "deployment-ready CloudFormation YAML template. All resources, "
                 "parameters, outputs, and cross-resource references must be included."
             ),
             phase=SkillPhase.ENGINEERING,
             trigger_condition=(
-                "intent.resources is non-empty AND template.body is empty"
+                "intent.objectives is non-empty AND template.body is empty"
             ),
             writes_to=["template.body", "template.version"],
             reads_from=[
-                "intent.resources",
-                "intent.constraints",
-                "intent.acceptance_criteria",
+                "intent.raw_prompt",
+                "intent.objectives",
                 "template.remediation_hints",
             ],
             priority=10,
@@ -62,9 +55,9 @@ class GeneralEngineerSkill(Skill):
         )
 
     def can_trigger(self, god: GroundedObjectivesDocument) -> bool:
-        has_resources = bool(god.intent.resources)
+        has_objectives = bool(god.intent.objectives)
         no_template = not god.template.body
-        return has_resources and no_template
+        return has_objectives and no_template
 
     def execute(self, context: SkillContext) -> SkillResult:
         god = context.god
@@ -72,6 +65,7 @@ class GeneralEngineerSkill(Skill):
         llm: Optional[OpenRouterClient] = context.get_config("llm")
         tel: Optional[TelemetryRecorder] = context.get_config("telemetry")
         iteration: int = context.iteration
+        max_output_tokens: int = context.get_config("engineer_max_output_tokens", 8192)
 
         if llm is None:
             return SkillResult.failure(
@@ -80,61 +74,29 @@ class GeneralEngineerSkill(Skill):
             )
 
         # ------------------------------------------------------------------
-        # Build prompt context from the full GOD
+        # Build prompt context from prompt + objective source of truth.
         # ------------------------------------------------------------------
-        resources_spec = json.dumps(
-            [
-                {
-                    "resource_type": r.resource_type,
-                    "logical_name": r.logical_name,
-                    "priority": r.priority,
-                    "dependencies": r.dependencies,
-                    "properties_hints": r.properties_hints or {},
-                }
-                for r in god.intent.resources
-            ],
-            indent=2,
-        )
-
-        constraints = god.intent.constraints
-        constraints_spec = json.dumps(
-            {
-                "environment": constraints.environment,
-                "multi_az": constraints.multi_az,
-                "encryption_at_rest": constraints.encryption_at_rest,
-                "encryption_in_transit": constraints.encryption_in_transit,
-                "public_access_allowed": constraints.public_access_allowed,
-                "backup_enabled": constraints.backup_enabled,
-                "backup_retention_days": constraints.backup_retention_days,
-                "logging_enabled": constraints.logging_enabled,
-                "monitoring_enabled": constraints.monitoring_enabled,
-                "compliance_frameworks": constraints.compliance_frameworks,
-                "cost_optimization": constraints.cost_optimization,
-            },
-            indent=2,
-        )
-
-        acceptance_criteria = json.dumps(
-            [ac.to_dict() for ac in god.intent.acceptance_criteria],
-            indent=2,
-        ) if god.intent.acceptance_criteria else "(none defined)"
+        objectives_spec = json.dumps([o.description for o in god.intent.objectives], indent=2)
+        prompt_text = god.intent.raw_prompt or "(empty)"
 
         remediation_hints = getattr(god.template, "remediation_hints", "") or "(none)"
 
         system = ENGINEER_SYSTEM_PROMPT.format(
-            resources_spec=resources_spec,
-            constraints_spec=constraints_spec,
-            acceptance_criteria=acceptance_criteria,
+            prompt_text=prompt_text,
+            objectives_spec=objectives_spec,
             remediation_hints=remediation_hints,
         )
 
-        # Attach a compact GOD snapshot as additional user-turn context so the
-        # LLM can see resource counts, validation state, and prior round info.
-        god_snapshot_json = json.dumps(god.snapshot(), indent=2, default=str)
+        # Attach compact LLM context that includes objectives, previous template,
+        # and remediation history so regeneration avoids repeated mistakes.
+        god_context_json = json.dumps(god.llm_context(), indent=2, default=str)
+        previous_template = getattr(god.template, "previous_body", "") or "(none)"
         user_message = (
             "Generate the complete CloudFormation template.\n\n"
-            "## Full GOD snapshot (for reference)\n"
-            f"```json\n{god_snapshot_json}\n```"
+            "## Previous failed template\n"
+            f"```yaml\n{previous_template}\n```\n\n"
+            "## Grounded objectives context\n"
+            f"```json\n{god_context_json}\n```"
         )
 
         t0 = time.monotonic()
@@ -143,6 +105,7 @@ class GeneralEngineerSkill(Skill):
                 system=system,
                 user=user_message,
                 temperature=0.1,
+                max_output_tokens=max_output_tokens,
             )
             llm_ok = True
             llm_err = None
@@ -164,8 +127,8 @@ class GeneralEngineerSkill(Skill):
                 success=llm_ok,
                 error=llm_err,
                 extra={
-                    "resource_count": len(god.intent.resources),
-                    "ac_count": len(god.intent.acceptance_criteria),
+                    "objective_count": len(god.intent.objectives),
+                    "max_output_tokens": max_output_tokens,
                     "has_remediation_hints": bool(
                         getattr(god.template, "remediation_hints", "")
                     ),
@@ -204,7 +167,7 @@ class GeneralEngineerSkill(Skill):
 
         result.changes_made.append(
             f"Generated complete CFN template ({len(template_body)} chars, "
-            f"{len(god.intent.resources)} resources)"
+            f"{len(god.intent.objectives)} objectives)"
         )
         return result
 

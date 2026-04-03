@@ -41,7 +41,7 @@ from skill_framework import Skill, SkillContext, SkillRegistry, SkillResult
 from skills.engineer import GeneralEngineerSkill
 from skills.planner import PlannerSkill
 from skills.remediation import RemediationSkill
-from skills.validator import CFNLintValidatorSkill, CheckovValidatorSkill, IntentAlignmentValidatorSkill, YAMLSyntaxValidatorSkill
+from skills.validator import CFNLintValidatorSkill, CheckovValidatorSkill, YAMLSyntaxValidatorSkill
 from telemetry import TelemetryRecorder
 
 
@@ -64,7 +64,6 @@ def create_default_skills() -> list[Skill]:
     VALIDATION  : YAMLSyntaxValidatorSkill (priority 10)
                   CFNLintValidatorSkill    (priority 20)
                   CheckovValidatorSkill    (priority 30)
-                  IntentAlignmentValidatorSkill (priority 40)
     REMEDIATION : RemediationSkill
     """
     return [
@@ -73,7 +72,6 @@ def create_default_skills() -> list[Skill]:
         YAMLSyntaxValidatorSkill(),
         CFNLintValidatorSkill(),
         CheckovValidatorSkill(),
-        IntentAlignmentValidatorSkill(),
         RemediationSkill(),
     ]
 
@@ -105,12 +103,18 @@ class OrchestratorConfig:
     telemetry_dir: str = "telemetry"
     enable_telemetry: bool = True
 
+    # LLM output budgets
+    engineer_max_output_tokens: int = 8192
+    remediation_max_output_tokens: int = 8192
+
     def to_dict(self) -> dict:
         return {
             "max_total_iterations": self.max_total_iterations,
             "enable_checkpoints": self.enable_checkpoints,
             "enable_telemetry": self.enable_telemetry,
             "telemetry_dir": self.telemetry_dir,
+            "engineer_max_output_tokens": self.engineer_max_output_tokens,
+            "remediation_max_output_tokens": self.remediation_max_output_tokens,
         }
 
 
@@ -282,7 +286,7 @@ class Orchestrator:
         2. max_total_iterations exhausted      → ESCALATED  (ONLY stop condition)
         3. All validators PASS/SKIPPED/ERROR   → SUCCEEDED
         4. Any FAIL with blocking findings     → REMEDIATING
-        5. No intent resources yet             → PLANNING
+        5. No intent objectives yet            → PLANNING
         6. No template body yet                → ENGINEERING / ASSEMBLING
         7. Default                             → VALIDATING
         """
@@ -314,7 +318,7 @@ class Orchestrator:
             return OrchestratorState.REMEDIATING
 
         # ── Forward planning / engineering ───────────────────────────────────
-        if not self.god.intent.resources:
+        if not self.god.intent.objectives:
             return OrchestratorState.PLANNING
 
         if not self.god.template.resources and not self.god.template.body:
@@ -428,6 +432,8 @@ class Orchestrator:
                 "llm": self.config.llm_client,
                 "llm_timeout": max(30, timeout_s - 10),
                 "telemetry": self._telemetry,
+                "engineer_max_output_tokens": self.config.engineer_max_output_tokens,
+                "remediation_max_output_tokens": self.config.remediation_max_output_tokens,
             }
         )
         self.events.emit(OrchestratorEventType.SKILL_STARTED, {
@@ -485,6 +491,18 @@ class Orchestrator:
             "errors": result.errors
         })
         return result
+
+    @staticmethod
+    def _should_increment_iteration(skill: Skill, result: SkillResult) -> bool:
+        """
+        Count an iteration only when remediation resets validations and routes
+        execution back to planner or engineer.
+        """
+        return (
+            skill.metadata.phase == SkillPhase.REMEDIATION
+            and result.success
+            and result.next_skill_hint in ("planner", "engineer")
+        )
 
     def _record_execution(self, skill: Skill, result: SkillResult):
         entry = {
@@ -559,7 +577,6 @@ class Orchestrator:
         self._transition_to(OrchestratorState.PLANNING, "initialization complete")
 
         while self._iteration < self.config.max_total_iterations:
-            self._iteration += 1
             if self.config.verbose_logging:
                 self._log_iteration_status()
             if self.state.is_terminal():
@@ -621,6 +638,14 @@ class Orchestrator:
                     "retrying same phase next iteration."
                 )
 
+            if self._should_increment_iteration(skill, result):
+                self._iteration += 1
+                self._logger.info(
+                    "  Iteration counter incremented after remediation route "
+                    f"to {result.next_skill_hint}. "
+                    f"({self._iteration}/{self.config.max_total_iterations})"
+                )
+
         # Out of iteration budget
         if not self.state.is_terminal():
             self._logger.warning(
@@ -662,7 +687,9 @@ class Orchestrator:
 
     def _log_iteration_status(self):
         self._logger.info(f"\n{'--' * 25}")
-        self._logger.info(f"Iteration {self._iteration} | State: {self.state.name}")
+        self._logger.info(
+            f"Iteration {self._iteration} (remediation cycles) | State: {self.state.name}"
+        )
         self._logger.info(f"Validations: {self.god.get_validation_summary()}")
         self._logger.info(f"Remediation Rounds: {self.god.get_remediation_round()}")
 
