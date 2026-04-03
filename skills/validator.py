@@ -30,6 +30,7 @@
 from datetime import datetime
 import os
 import shutil
+import time
 import tempfile
 
 from enums import Severity, SkillPhase, ValidationStatus
@@ -177,6 +178,8 @@ class YAMLSyntaxValidatorSkill(Skill):
         self._ensure_runtime()
         god = context.god
         template_body = god.template.body
+        tel = context.get_config("telemetry")
+        t0 = time.monotonic()
 
         result = ValidationResult(validator_name="yaml_syntax")
         result.started_at = datetime.now().isoformat()
@@ -190,6 +193,7 @@ class YAMLSyntaxValidatorSkill(Skill):
                 error_msg = "\n".join(lint_errors)
                 result.status = ValidationStatus.FAIL
                 result.errors.append(error_msg)
+                result.raw_output = error_msg
                 result.findings.append(ValidationFinding(
                     rule_id="YAML001",
                     resource_name="template",
@@ -197,7 +201,23 @@ class YAMLSyntaxValidatorSkill(Skill):
                     severity=Severity.CRITICAL,
                     message=error_msg,
                 ))
+                result.completed_at = datetime.now().isoformat()
+                result.duration_ms = (time.monotonic() - t0) * 1000
                 god.set_validation_result("yaml_syntax", result, actor="yaml-validator")
+                if tel:
+                    tel.record_validation_result(
+                        validator_name="yaml_syntax",
+                        iteration=context.iteration,
+                        status=result.status.value,
+                        started_at=result.started_at,
+                        completed_at=result.completed_at,
+                        duration_ms=result.duration_ms,
+                        tool_version=result.tool_version,
+                        raw_output=result.raw_output,
+                        errors=result.errors,
+                        findings=[f.to_dict() for f in result.findings],
+                        metrics=result.metrics,
+                    )
                 return SkillResult.failure(self.metadata.name, f"YAML lint errors:\n{error_msg}")
 
         # ------------------------------------------------------------------
@@ -210,13 +230,31 @@ class YAMLSyntaxValidatorSkill(Skill):
                     f"Template root must be a YAML mapping, got {type(parsed).__name__}"
                 )
             result.status = ValidationStatus.PASS
+            result.raw_output = "yaml_syntax: PASS"
+            result.completed_at = datetime.now().isoformat()
+            result.duration_ms = (time.monotonic() - t0) * 1000
             god.set_validation_result("yaml_syntax", result, actor="yaml-validator")
+            if tel:
+                tel.record_validation_result(
+                    validator_name="yaml_syntax",
+                    iteration=context.iteration,
+                    status=result.status.value,
+                    started_at=result.started_at,
+                    completed_at=result.completed_at,
+                    duration_ms=result.duration_ms,
+                    tool_version=result.tool_version,
+                    raw_output=result.raw_output,
+                    errors=result.errors,
+                    findings=[f.to_dict() for f in result.findings],
+                    metrics=result.metrics,
+                )
             return SkillResult.success_with_changes(
                 self.metadata.name, ["yaml_syntax: PASS"]
             )
         except Exception as e:
             result.status = ValidationStatus.FAIL
             result.errors.append(str(e))
+            result.raw_output = str(e)
             result.findings.append(ValidationFinding(
                 rule_id="YAML001",
                 resource_name="template",
@@ -224,7 +262,23 @@ class YAMLSyntaxValidatorSkill(Skill):
                 severity=Severity.CRITICAL,
                 message=str(e),
             ))
+            result.completed_at = datetime.now().isoformat()
+            result.duration_ms = (time.monotonic() - t0) * 1000
             god.set_validation_result("yaml_syntax", result, actor="yaml-validator")
+            if tel:
+                tel.record_validation_result(
+                    validator_name="yaml_syntax",
+                    iteration=context.iteration,
+                    status=result.status.value,
+                    started_at=result.started_at,
+                    completed_at=result.completed_at,
+                    duration_ms=result.duration_ms,
+                    tool_version=result.tool_version,
+                    raw_output=result.raw_output,
+                    errors=result.errors,
+                    findings=[f.to_dict() for f in result.findings],
+                    metrics=result.metrics,
+                )
             return SkillResult.failure(self.metadata.name, f"YAML parse error: {e}")
 
     def _run_yamllint(self, template_body: str) -> list[str]:
@@ -303,6 +357,8 @@ class CFNLintValidatorSkill(Skill):
         self._ensure_runtime()
         god = context.god
         skill_result = SkillResult(success=True, skill_name=self.metadata.name)
+        tel = context.get_config("telemetry")
+        t0 = time.monotonic()
 
         vr = ValidationResult(validator_name="cfn_lint")
         vr.started_at = datetime.now().isoformat()
@@ -313,7 +369,24 @@ class CFNLintValidatorSkill(Skill):
             vr.status = ValidationStatus.ERROR
             vr.errors = ["cfn-lint not installed. Run: pip install cfn-lint"]
             vr.completed_at = datetime.now().isoformat()
+            vr.duration_ms = (time.monotonic() - t0) * 1000
             god.set_validation_result("cfn_lint", vr, self.metadata.name)
+            if tel:
+                tel.record_validation_result(
+                    validator_name="cfn_lint",
+                    iteration=context.iteration,
+                    status=vr.status.value,
+                    started_at=vr.started_at,
+                    completed_at=vr.completed_at,
+                    duration_ms=vr.duration_ms,
+                    tool_version=vr.tool_version,
+                    raw_output=vr.raw_output,
+                    errors=vr.errors,
+                    findings=[f.to_dict() for f in vr.findings],
+                    metrics=vr.metrics,
+                    command=["cfn-lint"],
+                    stderr="cfn-lint not installed. Run: pip install cfn-lint",
+                )
             skill_result.success = False
             return skill_result
 
@@ -377,7 +450,25 @@ class CFNLintValidatorSkill(Skill):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         vr.completed_at = datetime.now().isoformat()
+        vr.duration_ms = (time.monotonic() - t0) * 1000
         god.set_validation_result("cfn_lint", vr, self.metadata.name)
+        if tel:
+            tel.record_validation_result(
+                validator_name="cfn_lint",
+                iteration=context.iteration,
+                status=vr.status.value,
+                started_at=vr.started_at,
+                completed_at=vr.completed_at,
+                duration_ms=vr.duration_ms,
+                tool_version=vr.tool_version,
+                raw_output=vr.raw_output,
+                errors=vr.errors,
+                findings=[f.to_dict() for f in vr.findings],
+                metrics=vr.metrics,
+                command=cmd,
+                stdout=proc.stdout if 'proc' in locals() else None,
+                stderr=proc.stderr if 'proc' in locals() else None,
+            )
         return skill_result
 
     def _parse_cfn_lint_output(self, raw: str) -> list[ValidationFinding]:
@@ -527,6 +618,8 @@ class CheckovValidatorSkill(Skill):
         self._ensure_runtime()
         god = context.god
         skill_result = SkillResult(success=True, skill_name=self.metadata.name)
+        tel = context.get_config("telemetry")
+        t0 = time.monotonic()
 
         vr = ValidationResult(validator_name="checkov")
         vr.started_at = datetime.now().isoformat()
@@ -537,7 +630,24 @@ class CheckovValidatorSkill(Skill):
             vr.status = ValidationStatus.ERROR
             vr.errors = ["checkov not installed. Run: pip install checkov"]
             vr.completed_at = datetime.now().isoformat()
+            vr.duration_ms = (time.monotonic() - t0) * 1000
             god.set_validation_result("checkov", vr, self.metadata.name)
+            if tel:
+                tel.record_validation_result(
+                    validator_name="checkov",
+                    iteration=context.iteration,
+                    status=vr.status.value,
+                    started_at=vr.started_at,
+                    completed_at=vr.completed_at,
+                    duration_ms=vr.duration_ms,
+                    tool_version=vr.tool_version,
+                    raw_output=vr.raw_output,
+                    errors=vr.errors,
+                    findings=[f.to_dict() for f in vr.findings],
+                    metrics=vr.metrics,
+                    command=["checkov"],
+                    stderr="checkov not installed. Run: pip install checkov",
+                )
             skill_result.success = False
             return skill_result
 
@@ -599,7 +709,25 @@ class CheckovValidatorSkill(Skill):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         vr.completed_at = datetime.now().isoformat()
+        vr.duration_ms = (time.monotonic() - t0) * 1000
         god.set_validation_result("checkov", vr, self.metadata.name)
+        if tel:
+            tel.record_validation_result(
+                validator_name="checkov",
+                iteration=context.iteration,
+                status=vr.status.value,
+                started_at=vr.started_at,
+                completed_at=vr.completed_at,
+                duration_ms=vr.duration_ms,
+                tool_version=vr.tool_version,
+                raw_output=vr.raw_output,
+                errors=vr.errors,
+                findings=[f.to_dict() for f in vr.findings],
+                metrics=vr.metrics,
+                command=cmd,
+                stdout=raw_stdout,
+                stderr=raw_stderr,
+            )
         return skill_result
 
     def _parse_checkov_output(self, raw: str) -> list[ValidationFinding]:
@@ -753,6 +881,8 @@ class TrivyValidatorSkill(Skill):
         self._ensure_runtime()
         god = context.god
         skill_result = SkillResult(success=True, skill_name=self.metadata.name)
+        tel = context.get_config("telemetry")
+        t0 = time.monotonic()
 
         vr = ValidationResult(validator_name="trivy")
         vr.started_at = datetime.now().isoformat()
@@ -763,7 +893,24 @@ class TrivyValidatorSkill(Skill):
             vr.status = ValidationStatus.ERROR
             vr.errors = ["trivy not installed. Run: brew install trivy"]
             vr.completed_at = datetime.now().isoformat()
+            vr.duration_ms = (time.monotonic() - t0) * 1000
             god.set_validation_result("trivy", vr, self.metadata.name)
+            if tel:
+                tel.record_validation_result(
+                    validator_name="trivy",
+                    iteration=context.iteration,
+                    status=vr.status.value,
+                    started_at=vr.started_at,
+                    completed_at=vr.completed_at,
+                    duration_ms=vr.duration_ms,
+                    tool_version=vr.tool_version,
+                    raw_output=vr.raw_output,
+                    errors=vr.errors,
+                    findings=[f.to_dict() for f in vr.findings],
+                    metrics=vr.metrics,
+                    command=["trivy"],
+                    stderr="trivy not installed. Run: brew install trivy",
+                )
             skill_result.success = False
             return skill_result
 
@@ -826,7 +973,25 @@ class TrivyValidatorSkill(Skill):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         vr.completed_at = datetime.now().isoformat()
+        vr.duration_ms = (time.monotonic() - t0) * 1000
         god.set_validation_result("trivy", vr, self.metadata.name)
+        if tel:
+            tel.record_validation_result(
+                validator_name="trivy",
+                iteration=context.iteration,
+                status=vr.status.value,
+                started_at=vr.started_at,
+                completed_at=vr.completed_at,
+                duration_ms=vr.duration_ms,
+                tool_version=vr.tool_version,
+                raw_output=vr.raw_output,
+                errors=vr.errors,
+                findings=[f.to_dict() for f in vr.findings],
+                metrics=vr.metrics,
+                command=cmd,
+                stdout=raw_stdout,
+                stderr=raw_stderr,
+            )
         return skill_result
 
     def _parse_trivy_output(self, raw: str) -> list[ValidationFinding]:

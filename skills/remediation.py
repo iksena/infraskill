@@ -86,10 +86,34 @@ class RemediationSkill(Skill):
         llm: Optional[OpenRouterClient] = context.get_config("llm")
         iteration: int = context.iteration
         max_output_tokens: int = context.get_config("remediation_max_output_tokens", 8192)
+        skill_inputs = {
+            "template_length": len(god.template.body),
+            "objective_count": len(god.intent.objectives),
+            "validation_summary": god.get_validation_summary(),
+            "findings_summary": god.get_findings_summary(),
+            "max_output_tokens": max_output_tokens,
+        }
+
+        def emit_skill_telemetry(outputs: dict | None = None):
+            if not tel:
+                return
+            tel.record_skill_execution(
+                skill_name=self.metadata.name,
+                phase=self.metadata.phase.name,
+                iteration=iteration,
+                success=result.success,
+                duration_ms=result.duration_ms,
+                changes_made=result.changes_made,
+                errors=result.errors,
+                warnings=result.warnings,
+                inputs=skill_inputs,
+                outputs=outputs or {},
+            )
 
         relevant_findings = self._collect_relevant_findings(god)
         if not relevant_findings:
             result.warnings.append("No FAIL findings to remediate")
+            emit_skill_telemetry({"reason": "no_fail_findings"})
             return result
 
         llm_hints = self._build_llm_hints(
@@ -116,7 +140,7 @@ class RemediationSkill(Skill):
         ]
 
         if intent_findings:
-            return self._route_to_planner(
+            routed = self._route_to_planner(
                 god=god,
                 result=result,
                 round_num=round_num,
@@ -124,8 +148,16 @@ class RemediationSkill(Skill):
                 telemetry=tel,
                 iteration=iteration,
             )
+            emit_skill_telemetry({
+                "next_skill_hint": routed.next_skill_hint,
+                "remediation_round": round_num,
+                "route": "planner",
+                "findings_addressed": [f.rule_id for f in intent_findings],
+                "remediation_hints_length": len(getattr(god.template, "remediation_hints", "") or ""),
+            })
+            return routed
 
-        return self._route_to_engineer(
+        routed = self._route_to_engineer(
             god=god,
             result=result,
             round_num=round_num,
@@ -133,6 +165,14 @@ class RemediationSkill(Skill):
             telemetry=tel,
             iteration=iteration,
         )
+        emit_skill_telemetry({
+            "next_skill_hint": routed.next_skill_hint,
+            "remediation_round": round_num,
+            "route": "engineer",
+            "findings_addressed": [f.rule_id for f in relevant_findings],
+            "remediation_hints_length": len(getattr(god.template, "remediation_hints", "") or ""),
+        })
+        return routed
 
     @staticmethod
     def _collect_relevant_findings(

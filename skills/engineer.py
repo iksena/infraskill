@@ -66,12 +66,38 @@ class GeneralEngineerSkill(Skill):
         tel: Optional[TelemetryRecorder] = context.get_config("telemetry")
         iteration: int = context.iteration
         max_output_tokens: int = context.get_config("engineer_max_output_tokens", 8192)
+        skill_inputs = {
+            "prompt": god.intent.raw_prompt,
+            "objectives": [o.description for o in god.intent.objectives],
+            "objective_count": len(god.intent.objectives),
+            "remediation_hints": getattr(god.template, "remediation_hints", "") or "",
+            "previous_template_length": len(getattr(god.template, "previous_body", "") or ""),
+            "max_output_tokens": max_output_tokens,
+        }
+
+        def emit_skill_telemetry(outputs: dict | None = None):
+            if not tel:
+                return
+            tel.record_skill_execution(
+                skill_name=self.metadata.name,
+                phase=self.metadata.phase.name,
+                iteration=iteration,
+                success=result.success,
+                duration_ms=result.duration_ms,
+                changes_made=result.changes_made,
+                errors=result.errors,
+                warnings=result.warnings,
+                inputs=skill_inputs,
+                outputs=outputs or {},
+            )
 
         if llm is None:
-            return SkillResult.failure(
+            failure = SkillResult.failure(
                 self.metadata.name,
                 "No LLM client configured — cannot generate CloudFormation template.",
             )
+            emit_skill_telemetry({"error": failure.errors[0]})
+            return failure
 
         # ------------------------------------------------------------------
         # Build prompt context from prompt + objective source of truth.
@@ -136,19 +162,23 @@ class GeneralEngineerSkill(Skill):
             )
 
         if not llm_ok:
-            return SkillResult.failure(
+            failure = SkillResult.failure(
                 self.metadata.name,
                 f"LLM call failed during template generation: {llm_err}",
             )
+            emit_skill_telemetry({"error": llm_err, "raw_response": template_body})
+            return failure
 
         template_body = self._strip_fences(template_body)
 
         if "AWSTemplateFormatVersion" not in template_body:
-            return SkillResult.failure(
+            failure = SkillResult.failure(
                 self.metadata.name,
                 "LLM output does not appear to be a CloudFormation template "
                 "(missing AWSTemplateFormatVersion). Raw output logged at DEBUG.",
             )
+            emit_skill_telemetry({"error": failure.errors[0], "raw_response": template_body})
+            return failure
 
         before_body = god.template.body  # empty string on first run
         god.template.body = template_body
@@ -169,6 +199,11 @@ class GeneralEngineerSkill(Skill):
             f"Generated complete CFN template ({len(template_body)} chars, "
             f"{len(god.intent.objectives)} objectives)"
         )
+        emit_skill_telemetry({
+            "template_length": len(template_body),
+            "template_version": god.template.version,
+            "template_checksum": god.template.checksum,
+        })
         return result
 
     @staticmethod

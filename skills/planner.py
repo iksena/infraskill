@@ -62,13 +62,36 @@ class PlannerSkill(Skill):
         llm: Optional[OpenRouterClient] = context.get_config("llm")
         tel: Optional[TelemetryRecorder] = context.get_config("telemetry")
         iteration: int = context.iteration
+        skill_inputs = {
+            "prompt": god.intent.raw_prompt,
+            "remediation_hints": getattr(god.template, "remediation_hints", "") or "",
+            "objective_count_before": len(god.intent.objectives),
+        }
+
+        def emit_skill_telemetry(outputs: dict | None = None):
+            if not tel:
+                return
+            tel.record_skill_execution(
+                skill_name=self.metadata.name,
+                phase=self.metadata.phase.name,
+                iteration=iteration,
+                success=result.success,
+                duration_ms=result.duration_ms,
+                changes_made=result.changes_made,
+                errors=result.errors,
+                warnings=result.warnings,
+                inputs=skill_inputs,
+                outputs=outputs or {},
+            )
 
         if llm is None:
-            return SkillResult.failure(
+            failure = SkillResult.failure(
                 self.metadata.name,
                 "No LLM client configured. PlannerSkill requires an LLM to extract "
                 "objectives from the prompt.",
             )
+            emit_skill_telemetry({"error": failure.errors[0]})
+            return failure
 
         remediation_hints = getattr(god.template, "remediation_hints", "") or ""
         user_message = god.intent.raw_prompt
@@ -118,15 +141,19 @@ class PlannerSkill(Skill):
             )
 
         if not llm_ok:
-            return SkillResult.failure(self.metadata.name, f"LLM call failed: {llm_err}")
+            failure = SkillResult.failure(self.metadata.name, f"LLM call failed: {llm_err}")
+            emit_skill_telemetry({"error": llm_err, "raw_response": raw})
+            return failure
 
         data = self._parse_json_with_retry(raw, user_message, llm, tel, iteration)
         if data is None:
-            return SkillResult.failure(
+            failure = SkillResult.failure(
                 self.metadata.name,
                 "Planner LLM did not return valid JSON after retry. "
                 "Check model availability or prompt.",
             )
+            emit_skill_telemetry({"error": failure.errors[0], "raw_response": raw})
+            return failure
 
         is_replan = bool(god.template.body)
         before_objectives = list(god.intent.objectives) if god.intent.objectives else []
@@ -162,6 +189,12 @@ class PlannerSkill(Skill):
             )
 
         result.changes_made.append(f"LLM extracted {len(god.intent.objectives)} grounded objectives")
+        emit_skill_telemetry({
+            "objective_count_after": len(god.intent.objectives),
+            "objectives": [o.description for o in god.intent.objectives],
+            "parser_version": god.intent.parser_version,
+            "parsed_at": god.intent.parsed_at,
+        })
         return result
 
     @staticmethod

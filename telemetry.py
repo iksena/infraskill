@@ -7,6 +7,7 @@ Writes five files per pipeline run into  ./telemetry/<run_id>/:
   llm_conversations.jsonl   — every LLM call (prompt, response, timing)
   god_changes.jsonl         — every mutation to the GOD (field, before, after)
   skill_executions.jsonl    — per-skill timing, inputs, outputs, errors
+    validation_results.jsonl  — every validator result/log payload
   orchestrator_events.jsonl — every orchestrator state-machine event
   run_summary.csv           — one row per run (append mode)
 
@@ -69,7 +70,7 @@ class TelemetryRecorder:
         "run_id", "started_at", "finished_at", "prompt_snippet",
         "final_state", "iterations", "duration_ms", "remediation_rounds",
         "llm_calls", "total_prompt_tokens", "total_response_tokens",
-        "yaml_syntax", "cfn_lint", "checkov",
+        "yaml_syntax", "cfn_lint", "checkov", "trivy",
     ]
 
     def __init__(self, base_dir: str = "telemetry"):
@@ -105,7 +106,13 @@ class TelemetryRecorder:
         self._run_dir = self._base_dir / run_id
         self._run_dir.mkdir(parents=True, exist_ok=True)
 
-        for name in ("llm_conversations", "god_changes", "skill_executions", "orchestrator_events"):
+        for name in (
+            "llm_conversations",
+            "god_changes",
+            "skill_executions",
+            "validation_results",
+            "orchestrator_events",
+        ):
             path = self._run_dir / f"{name}.jsonl"
             self._fh[name] = open(path, "a", encoding="utf-8", buffering=1)  # line-buffered
 
@@ -285,6 +292,13 @@ class TelemetryRecorder:
         inputs: Optional[dict] = None,
         outputs: Optional[dict] = None,
     ) -> None:
+        """
+        Record a skill execution event with optional structured inputs/outputs.
+
+        Use inputs/outputs to snapshot the state the skill consumed and the
+        concrete values it produced so downstream analysis can correlate the
+        execution with validator results and LLM calls.
+        """
         self._write_jsonl("skill_executions", {
             "event": "skill_execution",
             "run_id": self._run_id,
@@ -300,6 +314,59 @@ class TelemetryRecorder:
             "inputs": {k: _safe_truncate(v) for k, v in (inputs or {}).items()},
             "outputs": {k: _safe_truncate(v) for k, v in (outputs or {}).items()},
         })
+
+    # ------------------------------------------------------------------
+    # Validation result recorder
+    # ------------------------------------------------------------------
+
+    def record_validation_result(
+        self,
+        *,
+        validator_name: str,
+        iteration: int,
+        status: str,
+        started_at: Optional[str],
+        completed_at: Optional[str],
+        duration_ms: float,
+        tool_version: str,
+        raw_output: str,
+        errors: list[str],
+        findings: list[dict],
+        metrics: Optional[dict] = None,
+        command: Optional[list[str]] = None,
+        stdout: Optional[str] = None,
+        stderr: Optional[str] = None,
+    ) -> None:
+        """
+        Record the full validator result, including raw logs and parsed findings.
+
+        This is separate from GOD state so telemetry keeps the original tool
+        output even when later remediation resets the validation results.
+        """
+        record = {
+            "event": "validation_result",
+            "run_id": self._run_id,
+            "timestamp": _now_iso(),
+            "iteration": iteration,
+            "validator_name": validator_name,
+            "status": status,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "duration_ms": round(duration_ms, 2),
+            "tool_version": tool_version,
+            "raw_output": _safe_truncate(raw_output, 12000),
+            "errors": [_safe_truncate(e, 4000) for e in errors],
+            "findings_count": len(findings),
+            "findings": [_safe_truncate(f, 4000) for f in findings[:50]],
+            "metrics": metrics or {},
+        }
+        if command:
+            record["command"] = command
+        if stdout is not None:
+            record["stdout"] = _safe_truncate(stdout, 12000)
+        if stderr is not None:
+            record["stderr"] = _safe_truncate(stderr, 12000)
+        self._write_jsonl("validation_results", record)
 
     # ------------------------------------------------------------------
     # Orchestrator event recorder
@@ -356,6 +423,7 @@ class TelemetryRecorder:
                 "yaml_syntax": validation_summary.get("yaml_syntax", "N/A"),
                 "cfn_lint": validation_summary.get("cfn_lint", "N/A"),
                 "checkov": validation_summary.get("checkov", "N/A"),
+                "trivy": validation_summary.get("trivy", "N/A"),
             })
 
     # ------------------------------------------------------------------
