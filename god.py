@@ -128,6 +128,7 @@ class Template:
     metadata: dict = field(default_factory=dict)
     checksum: str = ""
     previous_body: str = ""
+    remediation_hints: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -135,6 +136,12 @@ class Template:
             "version": self.version,
             "last_modified_by": self.last_modified_by,
             "last_modified_at": self.last_modified_at,
+            "body": self.body,
+            "previous_body": self.previous_body,
+            "remediation_hints": self.remediation_hints,
+            "parameters": self.parameters,
+            "outputs": self.outputs,
+            "metadata": self.metadata,
             "body_length": len(self.body),
             "previous_body_length": len(self.previous_body),
             "resource_blocks": list(self.resources.keys()),
@@ -497,11 +504,22 @@ class GroundedObjectivesDocument:
     # -------------------------------------------------------------------------
 
     def snapshot(self) -> dict:
+        latest_remediation = self.remediation_log[-1] if self.remediation_log else None
         return {
             "summary": {
                 "template_version": self.template.version,
                 "template_length": len(self.template.body),
                 "remediation_rounds": self.get_remediation_round(),
+                "latest_objectives_change_at": self.intent.parsed_at,
+                "latest_template_change_at": self.template.last_modified_at,
+                "latest_template_changed_by": self.template.last_modified_by,
+                "latest_remediation_feedback_length": len(self.template.remediation_hints),
+                "latest_remediation_entry_at": (
+                    latest_remediation.timestamp if latest_remediation else None
+                ),
+                "latest_remediation_entry_by": (
+                    latest_remediation.skill_name if latest_remediation else None
+                ),
                 "validation_summary": self.get_validation_summary(),
                 "findings_summary": self.get_findings_summary(),
                 "locked_fields": list(self._locked_fields),
@@ -523,6 +541,7 @@ class GroundedObjectivesDocument:
         prompt payloads stay small enough to avoid truncation in normal runs.
         """
         objective_descriptions = [o.description for o in self.intent.objectives]
+        latest_remediation = self.remediation_log[-1] if self.remediation_log else None
         remediation_history = [
             {
                 "round": e.round,
@@ -536,11 +555,29 @@ class GroundedObjectivesDocument:
         return {
             "prompt": self.intent.raw_prompt,
             "objectives": objective_descriptions,
-            "template_context": {
-                "has_current_body": bool(self.template.body),
-                "has_previous_body": bool(self.template.previous_body),
-                "current_body_length": len(self.template.body),
-                "previous_body_length": len(self.template.previous_body),
+            "template": {
+                "body": self.template.body,
+                "previous_body": self.template.previous_body,
+                "version": self.template.version,
+                "last_modified_by": self.template.last_modified_by,
+                "last_modified_at": self.template.last_modified_at,
+                "checksum": self.template.checksum,
             },
-            "remediation_history": remediation_history,
+            "remediation": {
+                "hints": self.template.remediation_hints,
+                "latest_entry": (
+                    {
+                        "round": latest_remediation.round,
+                        "skill_name": latest_remediation.skill_name,
+                        "action_type": latest_remediation.action_type,
+                        "description": latest_remediation.description,
+                        "findings_addressed": latest_remediation.findings_addressed,
+                        "timestamp": latest_remediation.timestamp,
+                    }
+                    if latest_remediation
+                    else None
+                ),
+                "history": remediation_history,
+            },
+            "validation_summary": self.get_validation_summary(),
         }

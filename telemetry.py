@@ -47,7 +47,7 @@ def _estimate_tokens(text: str) -> int:
 def _safe_truncate(value: Any, max_chars: int = 8000) -> Any:
     """Truncate long strings so JSONL rows stay manageable."""
     if isinstance(value, str) and len(value) > max_chars:
-        return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
+        return value #[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
     return value
 
 

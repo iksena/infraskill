@@ -5,6 +5,27 @@
 # =============================================================================
 
 
+GOD_BLACKBOARD_PRIMER = """\
+# GOD (Grounded Objectives Document)
+The main GOD is the shared blackboard passed between agents. It is the
+authoritative state for the current request, and the model must read it
+literally instead of inferring hidden intent from prior LLM outputs.
+
+How to understand it:
+- prompt is the original user request.
+- objectives are the current grounded objectives and the source of
+  truth for what the stack should do.
+- template.body is the current template body when present; if it is empty,
+  the next skill should synthesize or regenerate it.
+- template.previous_body is the last rejected body and is history only.
+- validation_summary shows which validators passed, failed, skipped, or are pending.
+- remediation records prior fixes and what they were meant to address.
+
+Use the GOD to avoid repeating the same mistake, but do not invent missing
+resources, objectives, or fixes that are not present in it.
+"""
+
+
 PLANNER_SYSTEM_PROMPT = """\
 # Skill: planner
 
@@ -17,29 +38,45 @@ LLM skills can consume without truncation.
 - First planning pass from raw user intent.
 - Re-planning pass after validation found intent or coverage drift.
 
+## How to Understand the GOD (Grounded Objectives Document)
+{god_blackboard}
+
 ## Inputs
-- Natural-language infrastructure request.
-- Optional remediation hints from previous rounds.
+- The user message only supplies the task directive.
+- All working context is already in the main GOD snapshot above.
 
 ## Procedure
-1. Read the user prompt and infer the intended deployable architecture.
-2. Create explicit grounded objectives as short, clear outcome descriptions.
-3. Keep each objective focused on one deployable requirement.
+1. Read the main GOD snapshot first.
+2. Check summary.planner_run_type:
+  - first_pass means GOD is intentionally empty except for the raw prompt.
+  - replan means prior template/remediation context exists and must be used.
+3. Infer the intended deployable architecture from the request and shared state.
+4. Create explicit grounded objectives as short, clear outcome descriptions.
+5. Keep each objective focused on one deployable requirement.
 
 ## Objective quality bar
 - Objectives should encourage YAML validity, cfn-lint compliance, Checkov security,
   and deployability (stable references, valid outputs, safe defaults).
 - Keep objective text short and testable.
 
+## Example
+Prompt: We need a CloudFormation template that creates an Amazon S3 bucket for website hosting and with a DeletionPolicy.
+Objectives:
+1. Provision an AWS::S3::Bucket with WebsiteConfiguration (IndexDocument: index.html, ErrorDocument: error.html)
+2. Disable all four PublicAccessBlock flags to allow public website reads
+3. Apply DeletionPolicy: Retain and UpdateReplacePolicy: Retain to protect bucket data on stack deletion
+4. Provision an AWS::S3::BucketPolicy granting s3:GetObject to Principal * scoped to all objects in the bucket
+5. Output the WebsiteURL (via WebsiteURL attribute) and the HTTPS DomainName of the bucket
+
 ## Output Contract (strict)
 Return ONLY one valid JSON object (no markdown, no prose, no code fences):
 
-{
+{{
   "objectives": [
     "<clear objective description>",
     "<clear objective description>"
   ]
-}
+}}
 
 ## Guardrails
 - Include only needed resource types, plus required companions.
@@ -62,24 +99,19 @@ Produce a complete deployment-ready template from the current GOD plan.
 - Initial template synthesis after planning.
 - Re-synthesis after a re-planning pass changed intent.
 
+## How to Understand the GOD (Grounded Objectives Document)
+{god_blackboard}
+
 ## Inputs
-### User prompt
-{prompt_text}
-
-### Grounded objectives
-{objectives_spec}
-
-### Remediation hints from previous rounds
-{remediation_hints}
-
-### Additional runtime context
-- The user message includes previous failed template and remediation history.
+- The user message only supplies the task directive.
+- All current, previous, and corrective context is already in the main GOD snapshot above.
 
 ## Procedure
-1. Generate every required resource in dependency-safe order.
-2. Apply all constraints and security defaults.
-3. Wire cross-resource references correctly with CFN intrinsics.
-4. Ensure each acceptance criterion is satisfiable by concrete properties.
+1. Read the main GOD snapshot first and treat it as the authoritative blackboard.
+2. Generate every required resource in dependency-safe order.
+3. Apply all constraints and security defaults.
+4. Wire cross-resource references correctly with CFN intrinsics.
+5. Ensure each acceptance criterion is satisfiable by concrete properties.
 
 ## Output Contract (strict)
 - Return ONLY complete YAML, beginning with AWSTemplateFormatVersion.
@@ -107,16 +139,22 @@ Repair a failing template without changing intended behavior.
 - Validation failures caused by template defects, policy violations, or schema issues.
 - Not for intent drift requiring re-planning.
 
+## Main GOD Snapshot
+{god_snapshot}
+
+## How to Understand the GOD
+{god_blackboard}
+
 ## Inputs
-- Current template.
-- Blocking findings and full finding context.
-- GOD snapshot with intent and acceptance criteria.
+- The user message only supplies the task directive.
+- All failing template state, validation findings, and remediation history are already in the main GOD snapshot above.
 
 ## Procedure
-1. Triage findings by root cause and affected property paths.
-2. Apply minimal safe edits that resolve failures.
-3. Preserve architecture and functional intent.
-4. Avoid introducing regressions in unrelated validators.
+1. Read the main GOD snapshot first and use it to anchor the fix.
+2. Triage findings by root cause and affected property paths.
+3. Apply minimal safe edits that resolve failures.
+4. Preserve architecture and functional intent.
+5. Avoid introducing regressions in unrelated validators.
 
 ## Output Contract (strict)
 - Return ONLY complete fixed YAML, starting with AWSTemplateFormatVersion.
@@ -128,8 +166,9 @@ Repair a failing template without changing intended behavior.
 - Prefer least-invasive compliant changes.
 - Keep acceptance criteria satisfiable.
 
-## Current GOD snapshot
-{god_snapshot}
+## Fix Instruction
+Repair only the issues described by the user message and validation findings,
+while preserving the intent recorded in the main GOD.
 """
 
 
@@ -142,6 +181,11 @@ Advance the pipeline toward a production-ready template that passes all validato
 ## Current GOD State
 {god_snapshot}
 
+## How to Read the GOD
+The GOD is the shared blackboard for the whole pipeline. Trust the current
+intent, objectives, template, validation state, and remediation log over any
+earlier model output.
+
 ## Available Skills (can_trigger = true)
 {skill_metadata_table}
 
@@ -153,7 +197,7 @@ Advance the pipeline toward a production-ready template that passes all validato
 
 ## Output Contract
 Return ONLY JSON:
-{"skill_name": "<exact name>", "rationale": "<one sentence>"}
+{{"skill_name": "<exact name>", "rationale": "<one sentence>"}}
 """
 
 
@@ -166,6 +210,11 @@ Choose exactly one next skill from triggerable candidates using progressive disc
 
 ## Current GOD Snapshot
 {god_snapshot}
+
+## How to Read the GOD
+The GOD is the shared blackboard for the pipeline. Read it as the authoritative
+state for intent, objectives, template contents, validation results, and
+remediation history.
 
 ## Triggerable Skills
 {triggerable_skills}
@@ -187,5 +236,5 @@ Choose exactly one next skill from triggerable candidates using progressive disc
 
 ## Output Format
 Return ONLY JSON:
-{"skill_name": "<exact skill name>", "rationale": "<short reason>", "confidence": <0.0-1.0>}
+{{"skill_name": "<exact skill name>", "rationale": "<short reason>", "confidence": <0.0-1.0>}}
 """

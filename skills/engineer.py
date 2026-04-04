@@ -2,8 +2,8 @@
 # ENGINEERING SKILL  v2.3.0  — compact grounded-objectives context
 # -----------------------------------------------------------------------------
 # Changes from v2.2.0:
-#   - uses god.llm_context() instead of full god.snapshot() to keep LLM payload
-#     compact and reduce truncation pressure on objectives.
+#   - user message now carries the main GOD snapshot plus current/previous
+#     template bodies and remediation details.
 # -----------------------------------------------------------------------------
 
 import json
@@ -13,7 +13,7 @@ from typing import Optional
 from enums import SkillPhase
 from god import GroundedObjectivesDocument
 from llm_client import OpenRouterClient
-from prompt import ENGINEER_SYSTEM_PROMPT
+from prompt import ENGINEER_SYSTEM_PROMPT, GOD_BLACKBOARD_PRIMER
 from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
 from telemetry import TelemetryRecorder
 
@@ -99,30 +99,15 @@ class GeneralEngineerSkill(Skill):
             emit_skill_telemetry({"error": failure.errors[0]})
             return failure
 
-        # ------------------------------------------------------------------
-        # Build prompt context from prompt + objective source of truth.
-        # ------------------------------------------------------------------
-        objectives_spec = json.dumps([o.description for o in god.intent.objectives], indent=2)
-        prompt_text = god.intent.raw_prompt or "(empty)"
-
-        remediation_hints = getattr(god.template, "remediation_hints", "") or "(none)"
-
+        god_snapshot_json = json.dumps(god.llm_context(), indent=2, default=str)
         system = ENGINEER_SYSTEM_PROMPT.format(
-            prompt_text=prompt_text,
-            objectives_spec=objectives_spec,
-            remediation_hints=remediation_hints,
+            god_blackboard=GOD_BLACKBOARD_PRIMER,
         )
 
-        # Attach compact LLM context that includes objectives, previous template,
-        # and remediation history so regeneration avoids repeated mistakes.
-        god_context_json = json.dumps(god.llm_context(), indent=2, default=str)
-        previous_template = getattr(god.template, "previous_body", "") or "(none)"
         user_message = (
-            "Generate the complete CloudFormation template.\n\n"
-            "## Previous failed template\n"
-            f"```yaml\n{previous_template}\n```\n\n"
-            "## Grounded objectives context\n"
-            f"```json\n{god_context_json}\n```"
+            "Generate the deployment-ready CloudFormation template from the main GOD snapshot.\n\n"
+            "## Main GOD Snapshot\n"
+            f"{god_snapshot_json}"
         )
 
         t0 = time.monotonic()
@@ -155,9 +140,6 @@ class GeneralEngineerSkill(Skill):
                 extra={
                     "objective_count": len(god.intent.objectives),
                     "max_output_tokens": max_output_tokens,
-                    "has_remediation_hints": bool(
-                        getattr(god.template, "remediation_hints", "")
-                    ),
                 },
             )
 

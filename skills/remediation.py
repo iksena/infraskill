@@ -10,14 +10,19 @@ from checkov_context import get_checkov_policy_context
 from enums import SkillPhase, ValidationStatus
 from god import GroundedObjectivesDocument, RemediationEntry, ValidationFinding
 from llm_client import OpenRouterClient
+from prompt import GOD_BLACKBOARD_PRIMER
 from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
 from telemetry import TelemetryRecorder
+from trivy_context import get_trivy_policy_context
 
 _REPLAN_PREFIXES = ("INTENT", "COVERAGE", "AC-", "OBJ-")
 
 
 _REMEDIATION_HINT_SYSTEM_PROMPT = """\
 You are an AWS CloudFormation remediation assistant.
+
+## How to Understand the GOD
+{god_blackboard}
 
 Task:
 - Analyze validation failures (yaml syntax, cfn-lint, checkov, trivy).
@@ -32,6 +37,8 @@ Output rules:
     2) exact CloudFormation property path(s) to change,
     3) expected safe target value or structure.
 - Preserve architecture intent; suggest minimal edits.
+- Use only the GOD snapshot above as the authoritative source of intent,
+  objectives, template state, validation results, and remediation history.
 """
 
 
@@ -196,18 +203,23 @@ class RemediationSkill(Skill):
         if llm is None:
             return ""
 
-        validator_failures = {
+        security_remediation = any(
+            name in {"checkov", "trivy"} and vr.status == ValidationStatus.FAIL and bool(vr.findings)
+            for name, vr in god.validation_state.items()
+        )
+
+        failed_validators = {
             name: {
                 "status": vr.status.value,
                 "errors": vr.errors,
                 "findings": [
                     {
                         "rule_id": f.rule_id,
+                        "check_id": f.check_id,
                         "resource_name": f.resource_name,
                         "resource_type": f.resource_type,
                         "severity": f.severity.name,
                         "message": f.message,
-                        "check_id": f.check_id,
                         "line_number": f.line_number,
                     }
                     for f in vr.findings
@@ -216,28 +228,41 @@ class RemediationSkill(Skill):
             for name, vr in god.validation_state.items()
             if vr.status == ValidationStatus.FAIL
         }
-        findings_json = json.dumps(validator_failures, indent=2)
-        god_context = json.dumps(god.llm_context(), indent=2, default=str)
-        template_text = god.template.body #[:_MAX_TEMPLATE_CHARS_FOR_LLM]
-        checkov_policy_ctx = get_checkov_policy_context(findings)
+        validation_failures_json = json.dumps(failed_validators, indent=2, default=str)
+        checkov_policy_context = get_checkov_policy_context(findings) if security_remediation else ""
+        trivy_policy_context = get_trivy_policy_context(findings) if security_remediation else ""
+
+        god_snapshot_json = json.dumps(god.llm_context(), indent=2, default=str)
+
+        system = _REMEDIATION_HINT_SYSTEM_PROMPT.format(
+            god_blackboard=GOD_BLACKBOARD_PRIMER,
+        )
+
+        source_sections: list[str] = []
+        if checkov_policy_context:
+            source_sections.append(
+                "## Checkov policy source context\n"
+                f"{checkov_policy_context}"
+            )
+        if trivy_policy_context:
+            source_sections.append(
+                "## Trivy policy source context\n"
+                f"{trivy_policy_context}"
+            )
 
         user_message = (
-            "Provide remediation guidance for the failing IaC template.\n\n"
-            "Use both grounded objectives and the template together when proposing fixes.\n\n"
-            "## Validation failures\n"
-            f"```json\n{findings_json}\n```\n\n"
-            "## Current template\n"
-            f"```yaml\n{template_text}\n```\n\n"
-            "## Grounded objectives context\n"
-            f"```json\n{god_context}\n```\n\n"
-            "## Checkov policy source context\n"
-            f"{checkov_policy_ctx or '(none)'}"
+            "Provide remediation guidance from the main GOD snapshot.\n\n"
+            "## Main GOD Snapshot\n"
+            f"{god_snapshot_json}\n\n"
+            "## Validation failures to fix\n"
+            f"```json\n{validation_failures_json}\n```\n\n"
+            + ("\n\n".join(source_sections) if source_sections else "## Security policy source context\n(none)")
         )
 
         t0 = time.monotonic()
         try:
             hints = llm.complete(
-                system=_REMEDIATION_HINT_SYSTEM_PROMPT,
+                system=system,
                 user=user_message,
                 temperature=0.0,
                 max_output_tokens=max_output_tokens,
@@ -255,7 +280,7 @@ class RemediationSkill(Skill):
                 skill_name=self.metadata.name,
                 iteration=iteration,
                 call_purpose="remediation_hints",
-                system_prompt=_REMEDIATION_HINT_SYSTEM_PROMPT,
+                system_prompt=system,
                 user_message=user_message,
                 raw_response=hints,
                 duration_ms=llm_ms,

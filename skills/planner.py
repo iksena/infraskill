@@ -10,7 +10,7 @@ from typing import Optional
 from enums import SkillPhase
 from god import GroundedObjective, GroundedObjectivesDocument
 from llm_client import OpenRouterClient
-from prompt import PLANNER_SYSTEM_PROMPT
+from prompt import PLANNER_SYSTEM_PROMPT, GOD_BLACKBOARD_PRIMER
 from skill_framework import Skill, SkillContext, SkillMetadata, SkillResult
 from telemetry import TelemetryRecorder
 
@@ -93,14 +93,23 @@ class PlannerSkill(Skill):
             emit_skill_telemetry({"error": failure.errors[0]})
             return failure
 
-        remediation_hints = getattr(god.template, "remediation_hints", "") or ""
-        user_message = god.intent.raw_prompt
-        if remediation_hints:
-            user_message = (
-                f"{god.intent.raw_prompt}\n\n"
-                f"## Corrections from previous generation rounds\n"
-                f"{remediation_hints}"
-            )
+        is_first_pass = (
+            not god.intent.objectives
+            and not god.template.body
+            and not god.template.previous_body
+            and not (getattr(god.template, "remediation_hints", "") or "").strip()
+            and not god.remediation_log
+        )
+        planner_context = god.llm_context()
+        planner_context["planner_run_type"] = (
+            "first_pass" if is_first_pass else "replan"
+        )
+        god_snapshot_json = json.dumps(planner_context, indent=2, default=str)
+        system = PLANNER_SYSTEM_PROMPT.format(
+            god_snapshot=god_snapshot_json,
+            god_blackboard=GOD_BLACKBOARD_PRIMER,
+        )
+        user_message = "Plan the current request from the main GOD snapshot."
 
         # Record GOD reads
         if tel:
@@ -115,7 +124,7 @@ class PlannerSkill(Skill):
         t0 = time.monotonic()
         try:
             raw = llm.complete(
-                system=PLANNER_SYSTEM_PROMPT,
+                system=system,
                 user=user_message,
                 temperature=0.0,
             )
@@ -132,7 +141,7 @@ class PlannerSkill(Skill):
                 skill_name=self.metadata.name,
                 iteration=iteration,
                 call_purpose="plan",
-                system_prompt=PLANNER_SYSTEM_PROMPT,
+                system_prompt=system,
                 user_message=user_message,
                 raw_response=raw,
                 duration_ms=llm_ms,
@@ -208,7 +217,7 @@ class PlannerSkill(Skill):
             if isinstance(item, str):
                 desc = item.strip()
             elif isinstance(item, dict):
-                desc = str(item.get("description", "")).strip()
+                desc = item.get("description", "").strip()
             else:
                 desc = ""
             if desc:
@@ -237,13 +246,16 @@ class PlannerSkill(Skill):
         correction_system = (
             "Your previous response was not valid JSON. "
             "Return ONLY a valid JSON object — no markdown, no prose, no code fences. "
-            "The JSON must match the schema in the original system prompt."
+            "The JSON must match the schema in the original system prompt. "
+            "Treat the main GOD in the system prompt as authoritative, but do not "
+            "add extra fields."
         )
         correction_user = (
             f"Original request:\n{original_message}\n\n"
             f"Your previous (invalid) response:\n{raw[:2000]}\n\n"
             "Please return ONLY the corrected JSON object."
         )
+
         t0 = time.monotonic()
         try:
             corrected = llm.complete(
